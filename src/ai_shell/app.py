@@ -2,7 +2,6 @@
 import os
 import re
 import sys
-import json
 import time
 import shutil
 import signal
@@ -285,74 +284,18 @@ def ensure_logging() -> None:
     _logging_ready = True
 
 
-# Conversation history: the last 20 messages (user + assistant turns) give the
-# model multi-turn context WITHIN a session. It is ephemeral by default -- each
-# restart begins empty and wipes the file. Set SHELLAI_PERSIST_HISTORY=1 to
-# carry it across restarts instead.
-MAX_HISTORY = 20
-HISTORY_FILE = os.environ.get("SHELLAI_HISTORY_FILE") or os.path.join(
-    _user_dir("state"), "history.json"
-)
-PERSIST_HISTORY = os.environ.get("SHELLAI_PERSIST_HISTORY", "").strip().lower() in (
-    "1", "true", "yes", "on"
-)
+# Conversation history: the last few messages (user + assistant turns) give the
+# model multi-turn context so an immediate follow-up ("now the same for /var",
+# "sort that by size") works. In-memory only -- nothing is written to disk, and
+# every restart starts fresh. Kept small on purpose: a 1.5B model is easily
+# nudged off-track by stale earlier commands sitting in the window.
+MAX_HISTORY = 10  # messages == 5 request/command exchanges
 history: list[dict] = []
 
 
 def load_history() -> None:
-    """Prepare `history` for this session.
-
-    Ephemeral by default: start empty and remove any file left by a previous
-    run. With SHELLAI_PERSIST_HISTORY=1, load the last MAX_HISTORY messages.
-    """
-    global history
-    if not PERSIST_HISTORY:
-        history = []
-        try:
-            os.remove(HISTORY_FILE)
-        except OSError:
-            pass
-        return
-    try:
-        with open(HISTORY_FILE, encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, list):
-            history = [
-                m for m in data
-                if isinstance(m, dict) and m.get("role") in ("user", "assistant")
-                and isinstance(m.get("content"), str)
-            ][-MAX_HISTORY:]
-    except FileNotFoundError:
-        pass
-    except (json.JSONDecodeError, OSError):
-        history = []
-
-
-def save_history() -> None:
-    """Persist the current conversation history (no-op unless PERSIST_HISTORY)."""
-    if not PERSIST_HISTORY:
-        return
-    try:
-        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(history, f, ensure_ascii=False, indent=2)
-    except OSError as e:
-        print(f"Warning: could not save history: {e}")
-
-
-def seed_readline_history():
-    """Seed the interactive prompt's up-arrow history with past user queries.
-
-    Pulls only user-role entries from the persisted history so the arrow
-    recalls *your* queries (most recent first), not the model's commands.
-    No-op if readline is unavailable (e.g. non-interactive stdin).
-    """
-    if readline is None:
-        return
-    user_queries = [m["content"] for m in reversed(history) if m["role"] == "user"]
-    add = getattr(readline, "add_history", None) or getattr(readline, "add_history_item")
-    for q in user_queries:
-        add(q)
-    readline.set_history_length(MAX_HISTORY)  # cap like the rolling history
+    """Reset conversation history for a fresh session (in-memory only)."""
+    history.clear()
 
 
 SYSTEM_PROMPT_CORE = """You are a precise shell-command translator for {os_label}. Given a short
@@ -1471,11 +1414,10 @@ def looks_malformed(command: str):
 
 
 def record_turn(user_query: str, command: str) -> None:
-    """Append this turn to the rolling history and persist it to disk."""
+    """Append this turn to the in-memory rolling history."""
     history.append({"role": "user", "content": user_query})
     history.append({"role": "assistant", "content": command})
     del history[:-MAX_HISTORY]  # keep only the last MAX_HISTORY messages
-    save_history()
 
 
 def _kill_group(proc: "subprocess.Popen") -> None:
@@ -1973,8 +1915,6 @@ def _print_banner() -> None:
         c('multi-line: end a line with \\  or wrap a block in """', "2"),
         c('ESC stops a running command  ·  type "exit" to quit', "2"),
     ]
-    if history:
-        rows.append(c(f"resumed {len(history)} messages from history", "2"))
 
     def pad(s: str) -> str:
         vis = len(re.sub(r"\033\[[0-9;]*m", "", s))
@@ -1992,7 +1932,6 @@ def main():
     ensure_logging()
     load_history()
     get_local_model()
-    seed_readline_history()
     _print_banner()
     while True:
         request = read_request()

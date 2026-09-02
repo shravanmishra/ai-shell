@@ -98,8 +98,7 @@ and safety list:
 | `SHELLAI_MODEL_REPO` | `mlx-community/Qwen2.5-Coder-1.5B-Instruct-4bit` (MLX) |
 | `SHELLAI_GGUF_REPO` / `SHELLAI_GGUF_FILE` | `bartowski/Qwen2.5-Coder-1.5B-Instruct-GGUF` / `…-Q4_K_M.gguf` (llama.cpp) |
 | `SHELLAI_LLM_DIR` | `~/.cache/ai-shell/models` |
-| `SHELLAI_LOG_FILE` / `SHELLAI_HISTORY_FILE` | `~/.local/state/ai-shell/` |
-| `SHELLAI_PERSIST_HISTORY` | unset — history is per-session; each restart starts fresh. Set to `1` to carry it across restarts. |
+| `SHELLAI_LOG_FILE` | `~/.local/state/ai-shell/shellai.log` |
 | `SHELLAI_TIMEOUT` | `120` (seconds per command) |
 | `SHELLAI_REFINE_MAX` / `SHELLAI_NO_REFINE` | `2` retries on failure/rejection; set `SHELLAI_NO_REFINE=1` to disable |
 | `SHELLAI_PLATFORM` | auto-detected (`macos` \| `linux` \| `windows`) |
