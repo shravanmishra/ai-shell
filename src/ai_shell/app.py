@@ -827,6 +827,11 @@ systeminfo. `dir /s /b` recurses and prints bare paths; `dir /a:-d /o:-s`
 sorts by size. Suppress errors with `2>nul`. cmd has no real pipeline maths --
 keep commands simple.
 
+findstr matches TEXT in a line, never a number range -- NEVER use it to filter
+by file size or date. To filter files by size, use `forfiles` with `@fsize`
+(bytes): 1 KB=1024, 1 MB=1048576, 1 GB=1073741824. e.g. larger than 3 GB is
+`@fsize GEQ 3221225472`, larger than 500 MB is `@fsize GEQ 524288000`.
+
 For "my IP address": ipconfig | findstr /C:"IPv4"
 For the current Wi-Fi network: netsh wlan show interfaces | findstr /C:"SSID"
 For battery: wmic path Win32_Battery get EstimatedChargeRemaining
@@ -834,6 +839,10 @@ For battery: wmic path Win32_Battery get EstimatedChargeRemaining
 Examples (user request -> exact command):
 Q: tell me my ip address, the date, and my battery level
 A: ipconfig | findstr /C:"IPv4" & date /t & wmic path Win32_Battery get EstimatedChargeRemaining
+Q: list all files larger than 3 gb
+A: forfiles /P C:\\ /S /M * /C "cmd /c if @fsize GEQ 3221225472 echo @fsize @path" 2>nul
+Q: find files bigger than 500mb in my Downloads folder
+A: forfiles /P "%USERPROFILE%\\Downloads" /S /M * /C "cmd /c if @fsize GEQ 524288000 echo @fsize @path" 2>nul
 Q: list the 10 largest files in my Downloads folder
 A: dir /a:-d /o:-s "%USERPROFILE%\\Downloads"
 Q: find all .py files in the current project

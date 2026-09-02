@@ -81,6 +81,8 @@ def test_windows_powershell_profile():
 def test_windows_cmd_profile():
     with _with_profile("windows-cmd"):
         assert "cmd.exe" in app.SYSTEM_PROMPT
+        # size filtering must go through forfiles/@fsize, never findstr
+        assert "forfiles" in app.SYSTEM_PROMPT and "@fsize" in app.SYSTEM_PROMPT
         assert app.compat_fix("cat x.txt") == "type x.txt"
         assert app.compat_fix("ls") == "dir"
         assert app.is_trivial("dir") is True
