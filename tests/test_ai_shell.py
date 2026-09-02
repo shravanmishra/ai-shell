@@ -82,7 +82,9 @@ def test_windows_powershell_profile():
         assert app.classify_command("Remove-Item -Recurse -Force C:\\tmp")[0] == "danger"
         assert app.classify_command("Get-ChildItem C:\\")[0] == "ok"
         target, use_shell = app._exec_spec("Get-ChildItem")
-        assert use_shell is False and target[-2:] == ["-Command", "Get-ChildItem"]
+        assert use_shell is False and target[-2] == "-Command"
+        # wrapped so non-terminating errors don't force exit 1
+        assert "try { Get-ChildItem }" in target[-1] and target[-1].endswith("exit 0")
 
 
 def test_windows_cmd_profile():

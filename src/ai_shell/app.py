@@ -1473,7 +1473,13 @@ def _exec_spec(command: str):
         return PROFILE.exec_argv(command)
     if PROFILE.name == "windows-powershell":
         exe = shutil.which("pwsh") or shutil.which("powershell") or "powershell"
-        return [exe, "-NoProfile", "-NonInteractive", "-Command", command], False
+        # Wrap so a *terminating* error -> exit 1, but non-terminating errors
+        # (e.g. Get-ChildItem -Recurse skipping folders it can't read, with
+        # -ErrorAction SilentlyContinue) don't -- otherwise `powershell -Command`
+        # exits 1 for a pipeline that actually succeeded and produced output,
+        # which then trips the refine-on-failure prompt.
+        wrapped = f"try {{ {command} }} catch {{ [Console]::Error.WriteLine($_); exit 1 }}; exit 0"
+        return [exe, "-NoProfile", "-NonInteractive", "-Command", wrapped], False
     return command, True
 
 
