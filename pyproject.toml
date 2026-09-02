@@ -1,0 +1,60 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ai-shell-cli"
+version = "0.1.0"
+description = "Natural-language -> shell command translator running a local LLM"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Shravan Mishra" }]
+keywords = ["shell", "cli", "llm", "local", "mlx", "natural-language", "terminal"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "huggingface-hub>=0.24",
+]
+
+[project.optional-dependencies]
+mlx = ["mlx-lm>=0.20"]                 # Apple Silicon backend
+llama = ["llama-cpp-python>=0.3"]      # cross-platform GGUF backend
+dev = ["pytest>=8.0.0", "pytest-cov>=4.1.0", "build", "twine"]
+
+[project.scripts]
+ai-shell = "ai_shell.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/shravanmishra/ai-shell"
+Issues = "https://github.com/shravanmishra/ai-shell/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ai_shell"]
+
+[tool.hatch.build.targets.sdist]
+include = ["/src/ai_shell", "/tests", "/README.md", "/LICENSE", "/pyproject.toml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "."]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
+ignore = ["E501"]
