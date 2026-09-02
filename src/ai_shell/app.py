@@ -1951,7 +1951,6 @@ def _print_banner() -> None:
     w = 54  # inner width of the box (ASCII-only so padding is exact everywhere)
     rows = [
         c("platform ", "2") + PROFILE.os_label,
-        c("model    ", "2") + MODEL_REPO.split("/")[-1],
         "",
         c('multi-line: end a line with \\  or wrap a block in """', "2"),
         c('ESC stops a running command  ·  type "exit" to quit', "2"),
