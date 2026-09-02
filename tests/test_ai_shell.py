@@ -44,5 +44,58 @@ def test_apply_cd_is_in_process(tmp_path, monkeypatch):
 
 
 def test_platform_profile_selected():
-    assert app.PROFILE.name in ("macos", "linux")
+    assert app.PROFILE.name in (
+        "macos", "linux", "windows-powershell", "windows-cmd"
+    )
     assert app.SYSTEM_PROMPT.startswith("You are a precise shell-command translator")
+
+
+def _with_profile(name):
+    """Context-manager-ish helper: activate `name`, yield, restore the default."""
+    import contextlib
+
+    @contextlib.contextmanager
+    def _cm():
+        saved = app.PROFILE
+        app._activate(app.PROFILES[name])
+        try:
+            yield app
+        finally:
+            app._activate(saved)
+    return _cm()
+
+
+def test_windows_powershell_profile():
+    with _with_profile("windows-powershell"):
+        assert "PowerShell" in app.SYSTEM_PROMPT
+        assert app.compat_fix("ls") == "Get-ChildItem"
+        assert app.compat_fix("cat notes.txt") == "Get-Content notes.txt"
+        assert app.is_trivial("Get-ChildItem") is True
+        assert app.is_trivial("Get-ChildItem | Remove-Item") is False
+        assert app.classify_command("Remove-Item -Recurse -Force C:\\tmp")[0] == "danger"
+        assert app.classify_command("Get-ChildItem C:\\")[0] == "ok"
+        target, use_shell = app._exec_spec("Get-ChildItem")
+        assert use_shell is False and target[-2:] == ["-Command", "Get-ChildItem"]
+
+
+def test_windows_cmd_profile():
+    with _with_profile("windows-cmd"):
+        assert "cmd.exe" in app.SYSTEM_PROMPT
+        assert app.compat_fix("cat x.txt") == "type x.txt"
+        assert app.compat_fix("ls") == "dir"
+        assert app.is_trivial("dir") is True
+        assert app.classify_command("del /q C:\\*")[0] == "danger"
+        assert app.classify_command("rd /s /q C:\\build")[0] == "danger"
+        assert app._exec_spec("dir") == ("dir", True)
+
+
+def test_detect_windows_shell(monkeypatch):
+    monkeypatch.setenv("SHELLAI_SHELL", "cmd")
+    assert app._detect_windows_shell() == "cmd"
+    monkeypatch.setenv("SHELLAI_SHELL", "pwsh")
+    assert app._detect_windows_shell() == "powershell"
+    monkeypatch.delenv("SHELLAI_SHELL", raising=False)
+    monkeypatch.setenv("PROMPT", "$P$G")
+    assert app._detect_windows_shell() == "cmd"
+    monkeypatch.delenv("PROMPT", raising=False)
+    assert app._detect_windows_shell() == "powershell"

@@ -9,10 +9,12 @@ resolution-markers = [
 
 [[package]]
 name = "ai-shell-cli"
-version = "0.1.0"
+version = "1.0.0b0"
 source = { editable = "." }
 dependencies = [
     { name = "huggingface-hub" },
+    { name = "llama-cpp-python", marker = "platform_machine != 'arm64' or sys_platform != 'darwin'" },
+    { name = "mlx-lm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
 ]
 
 [package.optional-dependencies]
@@ -33,7 +35,9 @@ mlx = [
 requires-dist = [
     { name = "build", marker = "extra == 'dev'" },
     { name = "huggingface-hub", specifier = ">=0.24" },
+    { name = "llama-cpp-python", marker = "platform_machine != 'arm64' or sys_platform != 'darwin'", specifier = ">=0.3" },
     { name = "llama-cpp-python", marker = "extra == 'llama'", specifier = ">=0.3" },
+    { name = "mlx-lm", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'", specifier = ">=0.20" },
     { name = "mlx-lm", marker = "extra == 'mlx'", specifier = ">=0.20" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=4.1.0" },

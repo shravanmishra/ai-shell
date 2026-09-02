@@ -4,6 +4,7 @@ import re
 import sys
 import json
 import time
+import shutil
 import signal
 import logging
 import subprocess
@@ -91,25 +92,48 @@ def _detect_platform() -> str:
     return "macos" if sys.platform == "darwin" else "linux"
 
 
+def _detect_windows_shell() -> str:
+    """Pick the Windows dialect: "powershell" (default) or "cmd".
+
+    Honour SHELLAI_SHELL; otherwise fall back to a heuristic -- cmd.exe exports
+    %PROMPT% (default "$P$G"), PowerShell does not -- and default to PowerShell,
+    which is the shell Windows 10/11 open by default and can run almost anything.
+    """
+    forced = os.environ.get("SHELLAI_SHELL", "").strip().lower()
+    if forced in ("powershell", "pwsh", "ps"):
+        return "powershell"
+    if forced in ("cmd", "cmd.exe", "bat", "batch"):
+        return "cmd"
+    if os.environ.get("PROMPT"):
+        return "cmd"
+    return "powershell"
+
+
 PLATFORM = _detect_platform()
+WINDOWS_SHELL = _detect_windows_shell()
 
 
 @dataclass(frozen=True)
 class PlatformProfile:
     name: str
     os_label: str                 # goes in the system prompt's first line
-    stat_flag: str                # "-f" (BSD) | "-c" (GNU)
-    stat_size: str                # "%z" | "%s"
-    stat_name: str                # "%N" | "%n"
-    stat_mtime: str               # "%Sm" | "%y"
-    stat_interprets_escapes: bool  # BSD stat -f does NOT expand \t/\n; GNU -c does
-    primary_ipv4: str             # shell snippet -> the active interface's IPv4
-    wifi_ssid: str                # shell snippet -> current Wi-Fi SSID
-    battery: str                  # shell snippet -> battery status
-    prompt_extra: str             # dialect rules + few-shot examples
     compat_fix: Callable[[str], str]
+    prompt_extra: str             # dialect rules + few-shot examples
+    family: str = "posix"         # "posix" (macOS/Linux) | "windows"
+    primary_ipv4: str = ""        # shell snippet -> the active interface's IPv4
+    wifi_ssid: str = ""           # shell snippet -> current Wi-Fi SSID
+    battery: str = ""             # shell snippet -> battery status
+    # POSIX `stat` dialect -- unused (left empty) for the Windows family.
+    stat_flag: str = ""           # "-f" (BSD) | "-c" (GNU)
+    stat_size: str = ""           # "%z" | "%s"
+    stat_name: str = ""           # "%N" | "%n"
+    stat_mtime: str = ""          # "%Sm" | "%y"
+    stat_interprets_escapes: bool = False  # BSD stat -f does NOT expand \t/\n; GNU -c does
     danger_extra: tuple = ()      # extra (compiled_regex, reason) pairs
     trivial_cmds: frozenset = frozenset()
+    # Maps a command string to (argv-or-string, shell_bool) for the runner.
+    # None -> run the string through the system shell (POSIX sh / cmd.exe).
+    exec_argv: "Callable[[str], tuple] | None" = None
 
     def stat_expr(self, fmt: str) -> str:
         """`stat` invocation printing `fmt` (fmt may contain real \\t/\\n)."""
@@ -121,16 +145,10 @@ PROFILES: dict[str, PlatformProfile] = {}
 
 
 def _get_profile() -> PlatformProfile:
+    if PLATFORM == "windows":
+        return PROFILES[f"windows-{WINDOWS_SHELL}"]
     if PLATFORM in PROFILES:
         return PROFILES[PLATFORM]
-    # Windows: no native profile yet. Under WSL / Git Bash the commands are
-    # POSIX, so fall back to the Linux dialect with a heads-up.
-    print(
-        "shellai: no native Windows profile yet -- using the Linux dialect. "
-        "Run under WSL or Git Bash for best results "
-        "(set SHELLAI_PLATFORM=linux to silence this).",
-        file=sys.stderr,
-    )
     return PROFILES["linux"]
 
 # The model is loaded once per process and reused for every prompt,
@@ -361,12 +379,40 @@ If the request filters by a size in a human unit ("files larger than 3gb",
 """
 
 
+SYSTEM_PROMPT_CORE_WINDOWS = """You are a precise shell-command translator for {os_label}. Given a short
+natural-language request, reply with EXACTLY ONE raw, ready-to-run {shell} command.
+
+Strict output rules:
+- Start your answer directly with the command.
+- Do NOT wrap it in markdown, backticks, code fences, or labels.
+- Do NOT explain, think aloud, or add commentary. One line, one command.
+- If the request is ambiguous, pick the most common intent and do NOT ask
+  clarifying questions.
+
+Scope rules (very important):
+- If the user says "the whole drive", "everything", or does NOT specify a
+  folder, start from the drive root (C:\\), NOT the current directory.
+- If the user names a specific directory, use that path.
+- If the user says "in this folder", "here", or "current directory", use "." .
+
+Multiple asks: if ONE request bundles several unrelated questions ("my IP and
+the wifi name and the battery and the time"), join the commands with ; so every
+part runs.
+
+If the request filters by a size in a human unit ("files larger than 3gb",
+"bigger than 500mb"), report each match's size in THAT unit, not raw bytes.
+"""
+
+
 def build_system_prompt(profile: "PlatformProfile") -> str:
-    return (
-        SYSTEM_PROMPT_CORE.format(os_label=profile.os_label).strip()
-        + "\n\n"
-        + profile.prompt_extra.strip()
-    )
+    if profile.family == "windows":
+        shell = "PowerShell" if "powershell" in profile.name else "cmd.exe"
+        core = SYSTEM_PROMPT_CORE_WINDOWS.format(
+            os_label=profile.os_label, shell=shell
+        )
+    else:
+        core = SYSTEM_PROMPT_CORE.format(os_label=profile.os_label)
+    return core.strip() + "\n\n" + profile.prompt_extra.strip()
 
 
 def extract_command(raw: str) -> str:
@@ -544,6 +590,54 @@ def _macos_compat_fix(cmd: str) -> str:
     return _shared_compat_fix(cmd)
 
 
+def _windows_ps_compat_fix(cmd: str) -> str:
+    """Nudge POSIX-isms the model still emits into PowerShell.
+
+    The 1.5B model is Linux-biased; this deterministic pass rewrites the most
+    common leftovers so the line actually runs in `powershell -Command`.
+    """
+    # Strip POSIX stderr-to-null; PowerShell uses -ErrorAction instead.
+    cmd = re.sub(r"\s*2>\s*/dev/null\b", "", cmd)
+    cmd = re.sub(r"\s*2>\s*nul\b", "", cmd, flags=re.I)
+    # `find . -name "*.py"` (and -iname) -> Get-ChildItem -Recurse -Filter
+    m = re.match(
+        r'find\s+(\S+)\s+(?:-type\s+f\s+)?-i?name\s+["\']?([^"\']+)["\']?\s*$', cmd
+    )
+    if m:
+        path = "." if m.group(1) in (".", "./") else m.group(1)
+        return f'Get-ChildItem -Path {path} -Recurse -File -Filter {m.group(2)}'
+    toks = cmd.split()
+    if toks:
+        alias = {
+            "ls": "Get-ChildItem", "ll": "Get-ChildItem", "dir": "Get-ChildItem",
+            "cat": "Get-Content", "pwd": "Get-Location", "clear": "Clear-Host",
+            "rm": "Remove-Item", "cp": "Copy-Item", "mv": "Move-Item",
+            "which": "Get-Command", "head": "Get-Content", "wc": "Measure-Object",
+        }.get(toks[0])
+        if alias and toks[0] not in ("head", "wc"):
+            toks[0] = alias
+            cmd = " ".join(toks)
+    # `grep PATTERN` (not part of a pipe stage keyword) -> Select-String PATTERN
+    cmd = re.sub(r"(?<!\S)grep\s+(-\w+\s+)*", "Select-String ", cmd)
+    return cmd
+
+
+def _windows_cmd_compat_fix(cmd: str) -> str:
+    """Nudge POSIX-isms into classic cmd.exe builtins."""
+    cmd = re.sub(r"\s*2>\s*/dev/null\b", " 2>nul", cmd)
+    toks = cmd.split()
+    if toks:
+        alias = {
+            "ls": "dir", "ll": "dir", "cat": "type", "pwd": "cd", "clear": "cls",
+            "rm": "del", "cp": "copy", "mv": "move", "which": "where",
+        }.get(toks[0])
+        if alias:
+            toks[0] = alias
+            cmd = " ".join(toks)
+    cmd = re.sub(r"(?<!\S)grep\s+(-\w+\s+)*", "findstr ", cmd)
+    return cmd
+
+
 # --- Register the profiles and select the active one --------------------------
 _MACOS_IPV4 = (
     "ipconfig getifaddr $(route -n get default 2>/dev/null "
@@ -649,11 +743,157 @@ A: ls -d */""",
     ),
 )
 
+_B_WIN = r"(?:^|(?<=[\s;&|(]))"  # command-token start, Windows dialects
+
+PROFILES["windows-powershell"] = PlatformProfile(
+    name="windows-powershell",
+    os_label="Windows (PowerShell)",
+    family="windows",
+    compat_fix=_windows_ps_compat_fix,
+    primary_ipv4="(Get-NetIPConfiguration | Where-Object {$_.IPv4DefaultGateway}"
+                 ").IPv4Address.IPAddress",
+    wifi_ssid="(netsh wlan show interfaces | Select-String '^\\s*SSID')"
+              ".ToString().Split(':')[-1].Trim()",
+    battery="(Get-CimInstance Win32_Battery).EstimatedChargeRemaining",
+    prompt_extra="""Target Windows PowerShell. Use cmdlets, not POSIX tools: Get-ChildItem (not
+ls/find), Get-Content (not cat), Select-String (not grep), Measure-Object (not
+wc), Sort-Object, Select-Object. For file size/date, project Name, Length,
+LastWriteTime. Recurse with -Recurse; suppress errors with
+-ErrorAction SilentlyContinue (never `2>/dev/null`).
+
+For "my IP address":
+  (Get-NetIPConfiguration | ? {$_.IPv4DefaultGateway}).IPv4Address.IPAddress
+For the current Wi-Fi network: netsh wlan show interfaces | Select-String 'SSID'
+For battery: (Get-CimInstance Win32_Battery).EstimatedChargeRemaining
+
+Examples (user request -> exact command):
+Q: tell me my ip address, the date, and my battery level
+A: (Get-NetIPConfiguration | ? {$_.IPv4DefaultGateway}).IPv4Address.IPAddress; Get-Date; (Get-CimInstance Win32_Battery).EstimatedChargeRemaining
+Q: show me all files larger than 3gb, with sizes shown in GB not bytes
+A: Get-ChildItem C:\\ -Recurse -File -ErrorAction SilentlyContinue | Where-Object Length -gt 3GB | Select-Object FullName, @{n='GB';e={[math]::Round($_.Length/1GB,2)}}
+Q: list the 10 largest files in my Downloads folder
+A: Get-ChildItem $HOME\\Downloads -File | Sort-Object Length -Descending | Select-Object -First 10 Name, Length
+Q: find all .py files in the current project
+A: Get-ChildItem -Recurse -File -Filter *.py
+Q: count how many .log files are in C:\\Logs
+A: (Get-ChildItem C:\\Logs -Recurse -File -Filter *.log -ErrorAction SilentlyContinue).Count
+Q: show a table of the 15 biggest files with size and modified date
+A: Get-ChildItem C:\\ -Recurse -File -ErrorAction SilentlyContinue | Sort-Object Length -Descending | Select-Object -First 15 Name, Length, LastWriteTime | Format-Table
+Q: show the top 5 largest directories in the current folder
+A: Get-ChildItem -Directory | Select-Object Name, @{n='MB';e={[math]::Round((Get-ChildItem $_.FullName -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum/1MB,1)}} | Sort-Object MB -Descending | Select-Object -First 5
+Q: list all folders here
+A: Get-ChildItem -Directory""",
+    danger_extra=(
+        (re.compile(_B_WIN + r"(?:Remove-Item|ri|rm|del|erase|rd|rmdir)(?![\w-])",
+                    re.I | re.S), "deletes files or folders"),
+        (re.compile(r"-Recurse\b.*?-Force\b|-Force\b.*?-Recurse\b", re.I | re.S),
+         "recursive force delete/overwrite"),
+        (re.compile(_B_WIN + r"(?:Format-Volume|Clear-Disk|Initialize-Disk|diskpart"
+                    r"|Format(?:\.com)?)(?![\w-])", re.I | re.S),
+         "formats or wipes a disk"),
+        (re.compile(_B_WIN + r"Set-ExecutionPolicy(?![\w-])", re.I | re.S),
+         "changes the script execution policy"),
+        (re.compile(_B_WIN + r"(?:Stop|Restart)-Computer(?![\w-])", re.I | re.S),
+         "shuts down or reboots the machine"),
+        (re.compile(_B_WIN + r"(?:Stop-Process|kill|spps|taskkill)(?![\w-])",
+                    re.I | re.S), "kills a running process"),
+        (re.compile(r"Start-Process\b.*?-Verb\s+RunAs", re.I | re.S),
+         "relaunches elevated (UAC)"),
+        (re.compile(_B_WIN + r"(?:reg\s+delete|net\s+user\b.*?/delete)", re.I | re.S),
+         "deletes a registry key or user account"),
+        (re.compile(r">>?\s*(?:[A-Za-z]:\\|\\\\|\$HOME|\$env:)", re.S),
+         "redirects output onto a real path"),
+        (re.compile(r"(?:Out-File|Set-Content|Add-Content)\b", re.I | re.S),
+         "writes a file"),
+    ),
+    trivial_cmds=frozenset(
+        "Get-ChildItem gci ls dir Get-Location pwd gl Get-Date whoami hostname "
+        "Get-Content cat type Get-Process ps Get-ComputerInfo Get-Host "
+        "Get-Location Get-Volume".split()
+    ),
+)
+
+PROFILES["windows-cmd"] = PlatformProfile(
+    name="windows-cmd",
+    os_label="Windows (cmd.exe)",
+    family="windows",
+    compat_fix=_windows_cmd_compat_fix,
+    primary_ipv4='ipconfig | findstr /C:"IPv4"',
+    wifi_ssid='netsh wlan show interfaces | findstr /C:"SSID"',
+    battery="wmic path Win32_Battery get EstimatedChargeRemaining",
+    prompt_extra="""Target classic Windows cmd.exe (NOT PowerShell). Use builtins and bundled
+tools: dir (not ls/find), type (not cat), findstr (not grep), where, ipconfig,
+systeminfo. `dir /s /b` recurses and prints bare paths; `dir /a:-d /o:-s`
+sorts by size. Suppress errors with `2>nul`. cmd has no real pipeline maths --
+keep commands simple.
+
+For "my IP address": ipconfig | findstr /C:"IPv4"
+For the current Wi-Fi network: netsh wlan show interfaces | findstr /C:"SSID"
+For battery: wmic path Win32_Battery get EstimatedChargeRemaining
+
+Examples (user request -> exact command):
+Q: tell me my ip address, the date, and my battery level
+A: ipconfig | findstr /C:"IPv4" & date /t & wmic path Win32_Battery get EstimatedChargeRemaining
+Q: list the 10 largest files in my Downloads folder
+A: dir /a:-d /o:-s "%USERPROFILE%\\Downloads"
+Q: find all .py files in the current project
+A: dir /s /b *.py
+Q: count how many .log files are in C:\\Logs
+A: dir /s /b C:\\Logs\\*.log 2>nul | find /c /v ""
+Q: show all files in this folder with size and date
+A: dir /a:-d
+Q: list all folders here
+A: dir /a:d /b
+Q: what's my computer name and windows version
+A: hostname & ver""",
+    danger_extra=(
+        (re.compile(_B_WIN + r"(?:del|erase)(?![\w-])", re.I | re.S),
+         "deletes files (del)"),
+        (re.compile(_B_WIN + r"(?:rd|rmdir)(?![\w-])(?:.*?/s)?", re.I | re.S),
+         "removes a directory tree (rd /s)"),
+        (re.compile(_B_WIN + r"(?:format|diskpart|label)(?![\w-])", re.I | re.S),
+         "formats or relabels a disk"),
+        (re.compile(_B_WIN + r"(?:reg\s+delete|sc\s+(?:delete|stop)|net\s+user\b.*?/delete)",
+                    re.I | re.S), "deletes a registry key, service, or account"),
+        (re.compile(_B_WIN + r"(?:takeown|icacls\b.*?/grant|attrib\b.*?[+-]r)",
+                    re.I | re.S), "changes ownership or permissions"),
+        (re.compile(_B_WIN + r"(?:shutdown|taskkill)(?![\w-])", re.I | re.S),
+         "shuts down or kills processes"),
+        (re.compile(r">>?\s*(?:[A-Za-z]:\\|\\\\|%\w)", re.S),
+         "redirects output onto a real path"),
+    ),
+    trivial_cmds=frozenset(
+        "dir cd pwd whoami hostname ver vol tree type systeminfo ipconfig "
+        "tasklist".split()
+    ),
+)
+
+# Active profile + everything derived from it. Bound here for import-time
+# references and (re)bound by _activate() below -- tests swap profiles through it.
 PROFILE = _get_profile()
 SYSTEM_PROMPT = build_system_prompt(PROFILE)
 _PRIMARY_IPV4 = PROFILE.primary_ipv4
 _WIFI_DEVICE = PROFILE.wifi_ssid
-_STAT_TAB_EXPR = PROFILE.stat_expr(f"{PROFILE.stat_size}\t{PROFILE.stat_name}")
+_STAT_TAB_EXPR = ""
+
+
+def _activate(profile: "PlatformProfile") -> None:
+    """Point the module at `profile`: rebuild the system prompt, the net-info
+    snippets, the `stat` helper, the danger list and the trivial-command set.
+    Called once at import; tests call it again to exercise another dialect.
+    """
+    global PROFILE, SYSTEM_PROMPT, _PRIMARY_IPV4, _WIFI_DEVICE, _STAT_TAB_EXPR
+    global _DANGEROUS, _TRIVIAL_CMDS
+    PROFILE = profile
+    SYSTEM_PROMPT = build_system_prompt(profile)
+    _PRIMARY_IPV4 = profile.primary_ipv4
+    _WIFI_DEVICE = profile.wifi_ssid
+    _STAT_TAB_EXPR = (
+        profile.stat_expr(f"{profile.stat_size}\t{profile.stat_name}")
+        if profile.family == "posix" else ""
+    )
+    _DANGEROUS = _DANGEROUS_BASE + list(profile.danger_extra)
+    _TRIVIAL_CMDS = profile.trivial_cmds
 
 
 def compat_fix(cmd: str) -> str:
@@ -783,7 +1023,7 @@ def prefer_semicolons(cmd: str) -> str:
 # or privilege-escalating actions, not a hard block.
 _B = r"(?:^|(?<=[\s;&|(]))"  # position at the start of a command token
 
-_DANGEROUS = [
+_DANGEROUS_BASE = [
     (re.compile(_B + r"rm(?!\w)", re.S), "deletes files (rm)"),
     (re.compile(_B + r"rmdir(?!\w)", re.S), "removes directories (rmdir)"),
     (re.compile(_B + r"(?:mv|rename)(?!\w)", re.S), "moves or renames files"),
@@ -804,8 +1044,10 @@ _DANGEROUS = [
      "discards uncommitted git changes"),
 ]
 
-# Dialect-specific danger patterns (package removal, service control, ...).
-_DANGEROUS = _DANGEROUS + list(PROFILE.danger_extra)
+# Dialect-specific danger patterns (package removal, service control, ...) are
+# appended per-profile by _activate(), which also seeds _DANGEROUS / _TRIVIAL_CMDS.
+_DANGEROUS: list = list(_DANGEROUS_BASE)
+_activate(_get_profile())
 
 
 def classify_command(command: str):
@@ -830,9 +1072,10 @@ def classify_command(command: str):
 
 
 # Bare, argument-free lookups that only ever read/display state -- safe to
-# run without asking (the per-platform set). Anything with a pipe, redirect,
-# chaining, or substitution is excluded below regardless of the command name.
-_TRIVIAL_CMDS = PROFILE.trivial_cmds
+# run without asking (the per-platform set, seeded by _activate()). Anything
+# with a pipe, redirect, chaining, or substitution is excluded below
+# regardless of the command name.
+_TRIVIAL_CMDS: frozenset = PROFILE.trivial_cmds
 
 # find flags that always mutate, write, or hand control to `find` itself
 # (interactive -ok/-okdir) rather than just printing paths -- disqualifying
@@ -872,6 +1115,16 @@ def is_trivial(command: str) -> bool:
     or redirects still disqualifies.
     """
     cmd = _NULL_REDIR.sub(" ", command.strip()).strip()
+
+    if PROFILE.family == "windows":
+        # No POSIX find/date nuance here: a bare, single lookup with no pipe,
+        # chain, redirect, or sub-expression, whose verb is in the trivial set.
+        low = re.sub(r"\s*2>\s*nul\s*$", "", cmd, flags=re.I).strip()
+        if re.search(r"[|&<>`;]|\$\(|\$\{", low):
+            return False
+        toks = low.split()
+        return bool(toks) and toks[0] in _TRIVIAL_CMDS
+
     if re.search(r"[&<>`]|\$\(", cmd):
         return False
     if re.search(r"(?<!\\);", cmd):  # a *literal* ; chains commands; find's
@@ -947,13 +1200,18 @@ def get_shell_command(user_query: str) -> str:
 
     raw = raw.strip()
     extracted = extract_command(raw)
-    command = repair_command(extracted)
-    command = compat_fix(command)
-    command = fix_stat_format_escapes(command)
-    command = fix_size_unit_math(command)
-    command = report_size_in_filter_unit(command)
-    command = prefer_semicolons(command)
-    command = quiet_broad_find(command)
+    if PROFILE.family == "posix":
+        command = repair_command(extracted)
+        command = compat_fix(command)
+        command = fix_stat_format_escapes(command)
+        command = fix_size_unit_math(command)
+        command = report_size_in_filter_unit(command)
+        command = prefer_semicolons(command)
+        command = quiet_broad_find(command)
+    else:
+        # The POSIX passes above are all find/stat/awk/&&/2>/dev/null specific;
+        # the Windows dialects only need their own compat_fix.
+        command = compat_fix(extracted)
 
     logger.info(f"RAW MODEL RESPONSE ({elapsed:.2f}s): {raw}")
     if command != extracted:
@@ -1077,9 +1335,25 @@ def _kill_group(proc: "subprocess.Popen") -> None:
             continue
 
 
+def _exec_spec(command: str):
+    """Return (target, shell_bool) for subprocess: the active profile decides.
+
+    POSIX and Windows-cmd run the string through the system shell (sh / cmd.exe,
+    which is what `shell=True` uses). Windows-PowerShell wraps it so the model's
+    cmdlet one-liners are interpreted by PowerShell, not cmd.exe.
+    """
+    if PROFILE.exec_argv is not None:
+        return PROFILE.exec_argv(command)
+    if PROFILE.name == "windows-powershell":
+        exe = shutil.which("pwsh") or shutil.which("powershell") or "powershell"
+        return [exe, "-NoProfile", "-NonInteractive", "-Command", command], False
+    return command, True
+
+
 def _run_blocking(command: str, timeout: int) -> int:
+    target, use_shell = _exec_spec(command)
     try:
-        return subprocess.run(command, shell=True, timeout=timeout).returncode
+        return subprocess.run(target, shell=use_shell, timeout=timeout).returncode
     except subprocess.TimeoutExpired:
         print(f"\nCommand timed out after {timeout}s and was killed.")
         logger.warning(f"TIMEOUT after {timeout}s: {command}")
@@ -1090,8 +1364,9 @@ def _run_interruptible(command: str, timeout: int) -> int:
     """Run `command` while watching the keyboard: a lone ESC (or Ctrl-C)
     stops it and hands control back to the AI-Shell prompt. Unix tty only.
     """
+    target, use_shell = _exec_spec(command)
     proc = subprocess.Popen(
-        command, shell=True, stdin=subprocess.DEVNULL, start_new_session=True
+        target, shell=use_shell, stdin=subprocess.DEVNULL, start_new_session=True
     )
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd)
@@ -1200,9 +1475,11 @@ def apply_cd(command: str):
     (or `;`), <rest> is returned to run from the new directory.
     """
     global _prev_cwd
+    # `cd` on every dialect, plus PowerShell's Set-Location / sl / chdir aliases.
     m = re.match(
-        r"^cd(?:\s+(\"[^\"]*\"|'[^']*'|\S+))?\s*(?:(?:&&|;)\s*(.+))?$",
-        command.strip(),
+        r"^(?:cd|chdir|sl|Set-Location)(?:\s+(\"[^\"]*\"|'[^']*'|\S+))?"
+        r"\s*(?:(?:&&|;)\s*(.+))?$",
+        command.strip(), re.I,
     )
     if not m:
         return False, command

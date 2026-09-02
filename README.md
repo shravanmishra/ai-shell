@@ -47,10 +47,21 @@ ai-shell -m mlx-community/Qwen2.5-Coder-7B-Instruct-4bit   # bigger model
 
 ## Platforms
 
-Command generation is dialect-aware: **macOS** (BSD userland) and **Linux**
-(GNU coreutils) each get their own prompt, repair rules, and safety list.
-Native Windows isn't packaged yet — run it under WSL or Git Bash (treated as
-Linux). `SHELLAI_PLATFORM=macos|linux` overrides detection.
+Command generation is dialect-aware — each OS gets its own prompt, repair rules,
+and safety list:
+
+- **macOS** (BSD userland) and **Linux** (GNU coreutils)
+- **Windows** — native, no WSL needed. Two dialects:
+  - **PowerShell** (default) — generates cmdlets (`Get-ChildItem`, `Select-String`,
+    `Measure-Object`) and runs them through `powershell -Command`.
+  - **cmd.exe** — generates `dir` / `findstr` / `where` builtins.
+
+  The dialect auto-detects (cmd.exe exports `%PROMPT%`, PowerShell doesn't),
+  defaulting to PowerShell. Force it with `SHELLAI_SHELL=powershell|cmd`.
+  On Windows the backend is llama.cpp — `pipx install "ai-shell-cli[llama]"`
+  (MLX is Apple-only).
+
+`SHELLAI_PLATFORM=macos|linux|windows` overrides OS detection.
 
 ## Config (env vars)
 
@@ -63,7 +74,8 @@ Linux). `SHELLAI_PLATFORM=macos|linux` overrides detection.
 | `SHELLAI_LOG_FILE` / `SHELLAI_HISTORY_FILE` | `~/.local/state/ai-shell/` |
 | `SHELLAI_PERSIST_HISTORY` | unset — history is per-session; each restart starts fresh. Set to `1` to carry it across restarts. |
 | `SHELLAI_TIMEOUT` | `120` (seconds per command) |
-| `SHELLAI_PLATFORM` | auto-detected |
+| `SHELLAI_PLATFORM` | auto-detected (`macos` \| `linux` \| `windows`) |
+| `SHELLAI_SHELL` | Windows only: `powershell` (default) \| `cmd` |
 
 ## Develop
 
