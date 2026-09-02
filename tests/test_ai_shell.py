@@ -112,6 +112,92 @@ def test_run_blocking_swallows_ctrl_c(monkeypatch):
     assert app._run_blocking("sleep 100", 5) == 130
 
 
+def test_confirm_command_gate(monkeypatch):
+    assert app.confirm_command("ls -la") is True            # trivial -> auto
+    monkeypatch.setattr("builtins.input", lambda *_: "yes")
+    assert app.confirm_command("rm -rf /tmp/x") is True     # danger + typed "yes"
+    monkeypatch.setattr("builtins.input", lambda *_: "y")
+    assert app.confirm_command("rm -rf /tmp/x") is False    # bare "y" is not enough
+    assert app.confirm_command("cp a b") is True            # non-trivial + "y"
+
+
+def _script_gsc(monkeypatch, replies):
+    """Replace get_shell_command with a scripted stub; return the call log."""
+    calls, it = [], iter(replies)
+    def fake(query, extra_turns=None):
+        calls.append({"query": query, "extra_turns": extra_turns})
+        return next(it)
+    monkeypatch.setattr(app, "get_shell_command", fake)
+    monkeypatch.setattr(app, "record_turn", lambda *a: None)
+    monkeypatch.setattr(app, "REFINE_MAX", 2)
+    monkeypatch.setattr(app, "NO_REFINE", False)
+    return calls
+
+
+def test_refine_on_failure(monkeypatch):
+    calls = _script_gsc(monkeypatch, ["ls /nope", "ls -la"])
+    runs = []
+    def fake_run(cmd, *a, **k):
+        runs.append(cmd)
+        rc = 2 if len(runs) == 1 else 0
+        app._LAST_RUN.update(
+            command=cmd, exit=rc,
+            output="ls: /nope: No such file or directory" if rc else "",
+        )
+        return rc
+    monkeypatch.setattr(app, "run_command", fake_run)
+    monkeypatch.setattr(app, "confirm_command", lambda c: True)
+    monkeypatch.setattr("builtins.input", lambda *_: "y")   # yes, fix it
+
+    app.handle_query("list files")
+
+    assert runs == ["ls /nope", "ls -la"]
+    assert len(calls) == 2
+    turns = calls[1]["extra_turns"]
+    assert turns[0] == {"role": "assistant", "content": "ls /nope"}
+    assert "exit 2" in turns[1]["content"] and "No such file" in turns[1]["content"]
+
+
+def test_refine_on_rejection(monkeypatch):
+    calls = _script_gsc(monkeypatch, ["du -ah .", "find ~/Downloads -type f"])
+    monkeypatch.setattr(app, "run_command", lambda c, *a, **k: 0)
+    approvals = iter([False, True])
+    monkeypatch.setattr(app, "confirm_command", lambda c: next(approvals))
+    monkeypatch.setattr("builtins.input", lambda *_: "in ~/Downloads, files only")
+
+    app.handle_query("biggest files")
+
+    assert len(calls) == 2
+    fb = calls[1]["extra_turns"][1]["content"]
+    assert "don't want to run that" in fb and "in ~/Downloads, files only" in fb
+
+
+def test_refine_disabled(monkeypatch):
+    calls = _script_gsc(monkeypatch, ["ls /nope", "UNUSED"])
+    monkeypatch.setattr(app, "NO_REFINE", True)
+    monkeypatch.setattr(app, "run_command", lambda c, *a, **k: 2)
+    monkeypatch.setattr(app, "confirm_command", lambda c: True)
+    seen = []
+    monkeypatch.setattr("builtins.input", lambda p="": seen.append(p) or "y")
+
+    app.handle_query("list files")
+
+    assert len(calls) == 1        # no refine round-trip
+    assert seen == []             # never prompted "fix it?"
+
+
+def test_refine_budget(monkeypatch):
+    calls = _script_gsc(monkeypatch, ["c0", "c1", "c2", "c3"])
+    monkeypatch.setattr(app, "REFINE_MAX", 1)
+    monkeypatch.setattr(app, "run_command", lambda c, *a, **k: 1)
+    monkeypatch.setattr(app, "confirm_command", lambda c: True)
+    monkeypatch.setattr("builtins.input", lambda *_: "y")
+
+    app.handle_query("do a thing")
+
+    assert len(calls) == 2        # initial + exactly one refine, then stop
+
+
 def test_detect_windows_shell(monkeypatch):
     monkeypatch.setenv("SHELLAI_SHELL", "cmd")
     assert app._detect_windows_shell() == "cmd"

@@ -65,6 +65,12 @@ MODEL_DIR = os.path.join(LLM_DIR, MODEL_REPO.split("/")[-1])
 MAX_TOKENS = int(os.environ.get("SHELLAI_MAX_TOKENS", "256"))
 EXEC_TIMEOUT = int(os.environ.get("SHELLAI_TIMEOUT", "120"))
 
+# Refine-on-failure: when a command exits non-zero or you reject it, ask the
+# model for a corrected command (feeding back the error / your hint). Bounded
+# by REFINE_MAX retries per request; NO_REFINE=1 disables it entirely.
+REFINE_MAX = int(os.environ.get("SHELLAI_REFINE_MAX", "2"))
+NO_REFINE = os.environ.get("SHELLAI_NO_REFINE", "").strip() not in ("", "0", "false")
+
 # Model backend: "auto" prefers MLX when importable (Apple Silicon) and
 # otherwise uses llama.cpp with a local GGUF -- which works on Linux and
 # Windows too. Same model either way (Qwen2.5-Coder-1.5B, 4-bit).
@@ -1249,11 +1255,14 @@ def is_trivial(command: str) -> bool:
     return True
 
 
-def get_shell_command(user_query: str) -> str:
+def get_shell_command(user_query: str, extra_turns: list[dict] | None = None) -> str:
     """Translate a natural-language request into a single shell command.
 
     Pure "text in -> command out": raises on model/inference failure and
     does NOT touch history. Callers record the turn via record_turn().
+
+    `extra_turns` is appended after the user query -- the refine-on-failure
+    path uses it to hand back the previous command plus an error / a hint.
     """
     ensure_logging()
 
@@ -1261,9 +1270,12 @@ def get_shell_command(user_query: str) -> str:
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     messages.extend(history)
     messages.append({"role": "user", "content": user_query})
+    messages.extend(extra_turns or [])
 
     logger.info("=" * 60)
     logger.info(f"USER QUERY: {user_query}")
+    if extra_turns:
+        logger.info(f"REFINE TURNS: {extra_turns}")
 
     try:
         t0 = time.perf_counter()
@@ -1556,17 +1568,61 @@ def _run_interruptible_windows(command: str, timeout: int) -> int:
         return 130
 
 
-def run_command(command: str, timeout: int = EXEC_TIMEOUT) -> int:
+# The last command run(), its exit code, and (when we captured it) its output.
+# Feeds the refine-on-failure prompt in handle_query.
+_LAST_RUN: dict = {"command": None, "exit": None, "output": ""}
+
+# Recursive scanners can run for a long time and stream progress -- keep them on
+# the interruptible path (live output + ESC) rather than buffering their output.
+_RECURSIVE_SCAN = re.compile(r"^\s*(?:find|forfiles)\b|(?<![\w-])-Recurse\b", re.I)
+
+
+def _run_capture(command: str, timeout: int) -> tuple[int, str]:
+    """Run to completion, echo what it printed, and return (exit_code, output).
+
+    Used for quick read-only lookups so a failure's output can be handed back
+    to the model. No ESC-to-stop -- these finish in well under a second.
+    """
+    target, use_shell = _exec_spec(command)
+    try:
+        p = subprocess.run(
+            target, shell=use_shell, timeout=timeout,
+            capture_output=True, text=True,
+        )
+        out, err, rc = p.stdout or "", p.stderr or "", p.returncode
+    except subprocess.TimeoutExpired as e:
+        out = (e.stdout or "") if isinstance(e.stdout, str) else ""
+        err = (e.stderr or "") if isinstance(e.stderr, str) else ""
+        print(f"\nCommand timed out after {timeout}s and was killed.")
+        return 124, out + err
+    except KeyboardInterrupt:
+        print("\n\033[2m[stopped -- back to AI-Shell]\033[0m")
+        return 130, ""
+    if out:
+        sys.stdout.write(out if out.endswith("\n") else out + "\n")
+    if err:
+        sys.stderr.write(err if err.endswith("\n") else err + "\n")
+    return rc, out + err
+
+
+def run_command(command: str, timeout: int = EXEC_TIMEOUT,
+                capture: bool | None = None) -> int:
     """Execute a shell command, streaming its output, and return the exit code.
 
     While it runs, pressing ESC (or Ctrl-C) stops just that command and
     returns to the prompt -- the REPL keeps going. Falls back to a plain
-    blocking run when stdin is not an interactive terminal.
+    blocking run when stdin is not an interactive terminal. Quick read-only
+    lookups are captured instead (see `_run_capture` / `_LAST_RUN`).
     """
     ensure_logging()
+    if capture is None:
+        capture = is_trivial(command) and not _RECURSIVE_SCAN.search(command)
+    output = None
     tty_in = sys.stdin.isatty()
     try:
-        if tty_in and termios is not None:
+        if capture:
+            rc, output = _run_capture(command, timeout)
+        elif tty_in and termios is not None:
             rc = _run_interruptible(command, timeout)
         elif tty_in and msvcrt is not None:
             rc = _run_interruptible_windows(command, timeout)
@@ -1575,7 +1631,12 @@ def run_command(command: str, timeout: int = EXEC_TIMEOUT) -> int:
     except (OSError, ValueError) as e:
         print(f"\nCould not execute command: {e}")
         logger.error(f"EXECUTION ERROR ({e}): {command}")
+        _LAST_RUN.update(command=command, exit=1, output="")
         return 1
+    _LAST_RUN.update(
+        command=command, exit=rc,
+        output=(output or "")[-2000:],
+    )
     logger.info(f"EXECUTED (exit {rc}): {command}")
     # Surface a non-zero exit so a silent short-circuit isn't mistaken for
     # "it did nothing" -- e.g. `ipconfig getifaddr en0` prints nothing and
@@ -1647,51 +1708,106 @@ def apply_cd(command: str):
     return True, (m.group(2) or "").strip()
 
 
+def confirm_command(command: str) -> bool:
+    """The guard-rail gate: destructive commands need a typed 'yes', bare
+    read-only lookups auto-run, everything else asks y/N. The single place
+    this decision lives -- handle_query calls it once per attempt.
+    """
+    verdict, reason = classify_command(command)
+    if verdict == "danger":
+        print(f"\033[1;31m!  This command {reason}.\033[0m")
+        return input(
+            "Type 'yes' in full to run it (anything else cancels): "
+        ).strip().lower() == "yes"
+    if is_trivial(command):
+        print("\033[2m(auto-running: simple read-only command)\033[0m")
+        return True
+    return input("Execute this command? (y/N): ").strip().lower() == "y"
+
+
+def _refine(query: str, prev_command: str, feedback: str) -> "str | None":
+    """One refine round-trip: hand the model the previous command + a failure
+    message or hint, return a fresh command (None on inference failure)."""
+    logger.info(f"REFINE: {prev_command!r}  <-  {feedback!r}")
+    try:
+        return get_shell_command(query, extra_turns=[
+            {"role": "assistant", "content": prev_command},
+            {"role": "user", "content": feedback},
+        ])
+    except Exception as e:
+        print(f"\n\033[1;31mCould not refine the command: {e}\033[0m")
+        return None
+
+
 def handle_query(query: str) -> None:
-    """Translate one request, then propose / guard / (optionally) run it."""
+    """Translate one request, then propose / guard / (optionally) run it.
+
+    On a non-zero exit or a rejection, offer to hand the failure (or a
+    one-line hint) back to the model for a corrected command -- up to
+    REFINE_MAX times (SHELLAI_NO_REFINE=1 disables it).
+    """
     try:
         command = get_shell_command(query)
     except Exception as e:
         print(f"\n\033[1;31mCould not generate a command: {e}\033[0m")
         return
 
-    record_turn(query, command)
     print(f"\nProposed Command: \033[1;32m{command}\033[0m")
+    ran = command  # what we record to history at the end
 
-    bad, why = looks_malformed(command)
-    if bad:
-        print(f"\033[1;31mSkipping malformed command ({why}).\033[0m")
-        if any(k in why for k in ("two commands", "joined", "looped", "-exec")):
-            print("Looks like several requests at once -- ask one thing per line "
-                  '(or wrap one multi-line request in """).')
-        return
+    for attempt in range(1 + REFINE_MAX):
+        last_attempt = NO_REFINE or attempt == REFINE_MAX
 
-    # `cd` must change THIS process's directory to persist across turns.
-    handled, command = apply_cd(command)
-    if handled and not command:
-        return
+        bad, why = looks_malformed(command)
+        if bad:
+            print(f"\033[1;31mSkipping malformed command ({why}).\033[0m")
+            if any(k in why for k in ("two commands", "joined", "looped", "-exec")):
+                print("Looks like several requests at once -- ask one thing per "
+                      'line (or wrap one multi-line request in """).')
+            break
 
-    # Guard rail confirmation prompt; destructive commands need a typed "yes".
-    # A short allowlist of bare read-only lookups (ls, pwd, clear, ...) skips
-    # the prompt entirely -- the command is still printed above, just not run
-    # through an extra y/N for something this harmless.
-    verdict, reason = classify_command(command)
-    if verdict == "danger":
-        print(f"\033[1;31m!  This command {reason}.\033[0m")
-        approved = input(
-            "Type 'yes' in full to run it (anything else cancels): "
-        ).strip().lower() == "yes"
-    elif is_trivial(command):
-        print("\033[2m(auto-running: simple read-only command)\033[0m")
-        approved = True
-    else:
-        approved = input("Execute this command? (y/N): ").strip().lower() == "y"
+        # `cd` must change THIS process's directory to persist across turns.
+        handled, command = apply_cd(command)
+        if handled and not command:
+            break
+        ran = command
 
-    if approved:
+        if not confirm_command(command):
+            if last_attempt:
+                print("Execution cancelled.")
+                break
+            note = input(
+                "what should it do differently? (Enter to just retry): "
+            ).strip()
+            nxt = _refine(query, command,
+                          f"I don't want to run that."
+                          f"{(' ' + note) if note else ''} "
+                          "Give a different command for the same request.")
+            if nxt is None:
+                break
+            command = nxt
+            print(f"\nProposed Command: \033[1;32m{command}\033[0m")
+            continue
+
         sys.stdout.flush()  # the child writes to the fd directly; don't let
-        run_command(command)  # our own buffered prints land after its output
-    else:
-        print("Execution cancelled.")
+        rc = run_command(command)  # our own buffered prints land after its output
+        if rc in (0, 130) or last_attempt:
+            break
+        if input(f"\n\033[2m↻ that exited {rc}. Ask the model to fix it? "
+                 f"(y/N)\033[0m ").strip().lower() != "y":
+            break
+        fb = f"That command failed (exit {rc})."
+        if _LAST_RUN.get("command") == command and _LAST_RUN.get("output"):
+            fb += "\nOutput:\n" + _LAST_RUN["output"]
+        fb += "\nGive a corrected command for the same request."
+        nxt = _refine(query, command, fb)
+        if nxt is None:
+            break
+        command = nxt
+        print(f"\nProposed Command: \033[1;32m{command}\033[0m")
+        ran = command
+
+    record_turn(query, ran)
 
 
 def read_request():

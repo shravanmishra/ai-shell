@@ -44,6 +44,10 @@ ai-shell -m mlx-community/Qwen2.5-Coder-7B-Instruct-4bit   # bigger model
 - `cd` persists across turns; the prompt shows the current directory.
 - While a command runs, **ESC** stops it and returns you to the prompt.
 - Multi-line: end a line with `\`, or wrap a block in `"""`.
+- **Refine on failure:** if a command exits non-zero, or you reject it, ai-shell
+  offers to hand the error (or a one-line hint you type) back to the model for a
+  corrected command — up to `SHELLAI_REFINE_MAX` times (default 2). Set
+  `SHELLAI_NO_REFINE=1` to turn it off. Still one model, still confirms every step.
 
 ## Platforms
 
@@ -74,6 +78,7 @@ and safety list:
 | `SHELLAI_LOG_FILE` / `SHELLAI_HISTORY_FILE` | `~/.local/state/ai-shell/` |
 | `SHELLAI_PERSIST_HISTORY` | unset — history is per-session; each restart starts fresh. Set to `1` to carry it across restarts. |
 | `SHELLAI_TIMEOUT` | `120` (seconds per command) |
+| `SHELLAI_REFINE_MAX` / `SHELLAI_NO_REFINE` | `2` retries on failure/rejection; set `SHELLAI_NO_REFINE=1` to disable |
 | `SHELLAI_PLATFORM` | auto-detected (`macos` \| `linux` \| `windows`) |
 | `SHELLAI_SHELL` | Windows only: `powershell` (default) \| `cmd` |
 
