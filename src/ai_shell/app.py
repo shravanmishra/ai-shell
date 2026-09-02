@@ -239,10 +239,11 @@ def get_local_model():
                      "or:  SHELLAI_BACKEND=llama ai-shell  (any OS)")
         if _model is None or _tokenizer is None:
             ensure_model_downloaded()
-            print(f"Loading local model from {MODEL_DIR} ...")
+            ensure_logging()
+            logger.info(f"Loading local model from {MODEL_DIR} ...")
             t0 = time.perf_counter()
             _model, _tokenizer = mlx_load(MODEL_DIR)
-            print(f"Model ready in {time.perf_counter() - t0:.1f}s")
+            logger.info(f"Model ready in {time.perf_counter() - t0:.1f}s")
         return _model, _tokenizer
 
     # backend == "llama"
@@ -252,10 +253,11 @@ def get_local_model():
                  "    pip install 'ai-shell-cli[llama]'")
     if _llama is None:
         path = _ensure_gguf()
-        print(f"Loading local model from {path} ...")
+        ensure_logging()
+        logger.info(f"Loading local model from {path} ...")
         t0 = time.perf_counter()
         _llama = _Llama(model_path=path, n_ctx=4096, verbose=False)
-        print(f"Model ready in {time.perf_counter() - t0:.1f}s")
+        logger.info(f"Model ready in {time.perf_counter() - t0:.1f}s")
     return _llama
 
 
