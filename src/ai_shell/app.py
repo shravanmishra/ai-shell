@@ -1169,6 +1169,19 @@ _PS_MUTATING = re.compile(
     r"Disable|Enable|Suspend|Resume|Send|Format-Volume|iex)-?\w*"
 )
 
+
+def _ps_strip(s: str) -> str:
+    """Drop quoted strings and balanced {..} / @{..} blocks from a PowerShell
+    command, so a `;` or `|` inside a calculated property or a Where-Object
+    filter block isn't read as a command separator by is_trivial().
+    """
+    s = re.sub(r"'[^']*'|\"[^\"]*\"", "", s)
+    prev = None
+    while prev != s:                       # collapse innermost braces outward
+        prev = s
+        s = re.sub(r"@?\{[^{}]*\}", "", s)
+    return s
+
 # stderr/stdout redirections to the bit-bucket -- harmless, stripped before the
 # redirect check so they don't disqualify an otherwise trivial command.
 _NULL_REDIR = re.compile(r"\s*\d?>&?\s*(?:/dev/null|[12])\b")
@@ -1189,30 +1202,31 @@ def is_trivial(command: str) -> bool:
 
     if PROFILE.family == "windows":
         low = re.sub(r"\s*2>\s*(?:nul|\$null)\s*$", "", cmd, flags=re.I).strip()
-        if re.search(r"[<>`;&]|\$\(", low):
-            return False
 
         if PROFILE.name == "windows-powershell":
             # A read-only Get-* source, optionally piped through read-only
-            # filter/format stages. No mutating verb anywhere (covers blocks).
+            # filter/format stages. A mutating verb anywhere (incl. inside a
+            # script block) disqualifies -- checked on the raw string first.
             if _PS_MUTATING.search(low):
                 return False
-            stages = [s.strip() for s in low.split("|")]
-            if not stages[0]:
+            # Strip strings + {..}/@{..} blocks so a `;` or `|` inside a
+            # calculated property (`@{n='GB';e={...}}`) or a Where-Object filter
+            # block isn't mistaken for a command chain.
+            bare = _ps_strip(low)
+            if re.search(r"[<>`;&]|\$\(", bare):
                 return False
-            first = stages[0].split()[0].lower()
-            if first not in _PS_READ_CMDLETS:
+            stages = [s.strip() for s in bare.split("|")]
+            if not stages or not stages[0].split():
                 return False
-            for stage in stages[1:]:
-                toks = stage.split()
-                if not toks or toks[0].lower() not in (
-                    _PS_READ_CMDLETS | _PS_SAFE_FILTERS
-                ):
-                    return False
-            return True
+            if stages[0].split()[0].lower() not in _PS_READ_CMDLETS:
+                return False
+            ok = _PS_READ_CMDLETS | _PS_SAFE_FILTERS
+            return all(
+                st.split() and st.split()[0].lower() in ok for st in stages[1:]
+            )
 
         # cmd.exe has no real pipelines -- a single bare lookup only.
-        if "|" in low:
+        if re.search(r"[|&<>`;]|\$\(|\$\{", low):
             return False
         toks = low.split()
         return bool(toks) and toks[0].lower() in {c.lower() for c in _TRIVIAL_CMDS}

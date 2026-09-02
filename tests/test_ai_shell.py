@@ -76,6 +76,17 @@ def test_windows_powershell_profile():
             "Get-ChildItem C:\\ -Recurse -File | Where-Object Length -gt 3GB "
             "| Select-Object FullName, Length"
         ) is True
+        # `;` / `|` inside a calculated property or filter block is not a chain
+        assert app.is_trivial(
+            "Get-ChildItem C:\\ -Recurse -File -ErrorAction SilentlyContinue "
+            "| Where-Object Length -gt 1GB | Select-Object FullName, "
+            "@{n='GB';e={[math]::Round($_.Length/1GB,2)}}"
+        ) is True
+        assert app.is_trivial(
+            'Get-ChildItem | Where-Object { $_.Extension -eq ".log" } '
+            "| Select-Object Name"
+        ) is True
+        assert app.is_trivial("Get-ChildItem; Get-Date") is False  # real chain
         assert app.is_trivial("Get-ChildItem | Remove-Item") is False
         assert app.is_trivial("Get-ChildItem | ForEach-Object { Remove-Item $_ }") is False
         assert app.is_trivial("Get-ChildItem | Out-File list.txt") is False
