@@ -156,6 +156,15 @@ def test_quote_spaced_path(tmp_path, monkeypatch):
     assert app.quote_spaced_path("ls | wc -l") == "ls | wc -l"
 
 
+def test_find_with_suppressed_errors_exit1_is_success(monkeypatch):
+    monkeypatch.setattr(app, "_run_blocking", lambda c, t: 1)
+    monkeypatch.setattr(app, "_run_capture", lambda c, t: (1, ""))
+    # find exits 1 just for skipping unreadable dirs -> treated as success
+    assert app.run_command('find . -type f -name "*.xls" 2>/dev/null') == 0
+    # a non-find command that exits 1 is still a failure
+    assert app.run_command("grep -q needle 2>/dev/null haystack.txt") == 1
+
+
 def test_confirm_command_gate(monkeypatch):
     assert app.confirm_command("ls -la") is True            # trivial -> auto
     monkeypatch.setattr("builtins.input", lambda *_: "yes")

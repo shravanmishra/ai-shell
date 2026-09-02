@@ -1644,6 +1644,14 @@ def run_command(command: str, timeout: int = EXEC_TIMEOUT,
         logger.error(f"EXECUTION ERROR ({e}): {command}")
         _LAST_RUN.update(command=command, exit=1, output="")
         return 1
+    # `find ... 2>/dev/null` exits 1 merely for skipping a directory it can't
+    # read -- the user asked for those errors to be suppressed, so the scan
+    # succeeded. Don't report it as a failure or trigger refine-on-failure.
+    if rc == 1 and re.match(r"\s*find\b", command) and re.search(
+        r"2>\s*/dev/null", command
+    ):
+        rc = 0
+
     _LAST_RUN.update(
         command=command, exit=rc,
         output=(output or "")[-2000:],
