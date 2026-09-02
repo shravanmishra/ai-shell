@@ -112,6 +112,24 @@ def test_run_blocking_swallows_ctrl_c(monkeypatch):
     assert app._run_blocking("sleep 100", 5) == 130
 
 
+def test_quote_spaced_path(tmp_path, monkeypatch):
+    d = tmp_path / "Application Support" / "CloudDocs"
+    d.mkdir(parents=True)
+    f = d / "note.txt"
+    f.write_text("hi")
+    monkeypatch.chdir(tmp_path)
+
+    assert app.quote_spaced_path(
+        "cat ./Application Support/CloudDocs/note.txt"
+    ) == 'cat "./Application Support/CloudDocs/note.txt"'
+    # a real multi-arg command (paths don't join into something on disk) is left alone
+    assert app.quote_spaced_path("cat a.txt b.txt") == "cat a.txt b.txt"
+    # flags / already-quoted / pipes are left alone
+    assert app.quote_spaced_path("head -n 5 x y") == "head -n 5 x y"
+    assert app.quote_spaced_path('cat "a b.txt"') == 'cat "a b.txt"'
+    assert app.quote_spaced_path("ls | wc -l") == "ls | wc -l"
+
+
 def test_confirm_command_gate(monkeypatch):
     assert app.confirm_command("ls -la") is True            # trivial -> auto
     monkeypatch.setattr("builtins.input", lambda *_: "yes")

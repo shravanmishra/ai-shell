@@ -1310,11 +1310,40 @@ def get_shell_command(user_query: str, extra_turns: list[dict] | None = None) ->
         # The POSIX passes above are all find/stat/awk/&&/2>/dev/null specific;
         # the Windows dialects only need their own compat_fix.
         command = compat_fix(extracted)
+    command = quote_spaced_path(command)
 
     logger.info(f"RAW MODEL RESPONSE ({elapsed:.2f}s): {raw}")
     if command != extracted:
         logger.info(f"REPAIRED: {extracted}  ->  {command}")
     logger.info(f"EXTRACTED COMMAND: {command}")
+    return command
+
+
+_SINGLE_PATH_VERBS = re.compile(
+    r"^(cat|bat|less|more|head|tail|wc|nl|file|stat|open|xdg-open|ls|cd|"
+    r"type|Get-Content|gc)\s+(.+)$", re.I,
+)
+
+
+def quote_spaced_path(command: str) -> str:
+    """Quote an unquoted path that contains spaces.
+
+    The 1.5B model writes `cat ./Library/Application Support/x.txt` -- the shell
+    then splits it into two failing args. When the whole argument, joined,
+    actually exists on disk, wrap it in quotes. The `exists` check keeps this
+    from touching real multi-argument commands.
+    """
+    m = _SINGLE_PATH_VERBS.match(command.strip())
+    if not m:
+        return command
+    verb, rest = m.group(1), m.group(2).strip()
+    if rest.startswith("-") or " " not in rest:
+        return command
+    if any(ch in rest for ch in "|<>;&`\"'*?$()"):
+        return command
+    probe = os.path.expanduser(os.path.expandvars(rest))
+    if os.path.exists(probe):
+        return f'{verb} "{rest}"'
     return command
 
 
