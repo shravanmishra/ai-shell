@@ -28,6 +28,27 @@ downloads once on first run into `~/.cache/ai-shell/`.
 Backend selection is automatic (`SHELLAI_BACKEND=auto`): MLX when it's
 importable, otherwise llama.cpp. Force it with `SHELLAI_BACKEND=mlx|llama`.
 
+### Windows / Linux: the `[llama]` backend needs a prebuilt wheel
+
+`llama-cpp-python` has no C compiler bundled, so if `pip` can't find a matching
+prebuilt wheel it tries to **build from source** and fails with
+`CMAKE_C_COMPILER not set` / `nmake` errors. Two ways around it:
+
+```bash
+# 1. point pip at llama-cpp-python's own prebuilt-wheel index
+pipx install --force \
+  --pip-args "--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu" \
+  "ai-shell-cli[llama]"
+```
+
+- Prebuilt wheels exist only up to **Python 3.12** — on 3.13/3.14 there is no
+  wheel; install with a 3.12 interpreter (`pipx install --python python3.12 ...`).
+- CUDA build: swap `whl/cpu` for `whl/cu121` (or `cu122`, `cu124`).
+- Last resort — build it: install "Visual Studio Build Tools" with *Desktop
+  development with C++* + CMake, then retry the plain install.
+
+(macOS Apple Silicon has no build step: the `[mlx]` wheels are ready-made.)
+
 ## Use
 
 ```bash
