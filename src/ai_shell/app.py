@@ -20,6 +20,10 @@ try:
     import select as _select
 except ImportError:  # non-Unix -> ESC-to-stop degrades to a plain blocking run
     termios = None
+try:
+    import msvcrt  # Windows: keyboard polling for ESC-to-stop
+except ImportError:
+    msvcrt = None
 
 try:  # MLX backend (Apple Silicon) -- extra: ai-shell-cli[mlx]
     from mlx_lm import load as mlx_load, generate as mlx_generate
@@ -622,6 +626,28 @@ def _windows_ps_compat_fix(cmd: str) -> str:
     return cmd
 
 
+def _fix_forfiles_size(cmd: str) -> str:
+    """Rebuild a `forfiles ... /C "..."` size filter into a known-good form.
+
+    The 1.5B model reliably picks the byte threshold but mangles the /C payload
+    (repeats @fsize, drops @path, adds stray slashes). When we can see an
+    `@fsize <op> <bytes>` test, normalise the whole command to:
+        forfiles /P <path> /S /M * /C "cmd /c if @fsize GEQ <bytes> echo @path (@fsize bytes)"
+    """
+    if "forfiles" not in cmd.lower():
+        return cmd
+    thr = re.search(r"@fsize\s*(?:GEQ|GTR|>=?|-ge|-gt)\s*(\d[\d,]*)", cmd, re.I)
+    if not thr:
+        return cmd
+    n = thr.group(1).replace(",", "")
+    p = re.search(r"/P\s+(\"[^\"]+\"|\S+)", cmd, re.I)
+    path = p.group(1) if p else "C:\\"
+    return (
+        f'forfiles /P {path} /S /M * '
+        f'/C "cmd /c if @fsize GEQ {n} echo @path (@fsize bytes)" 2>nul'
+    )
+
+
 def _windows_cmd_compat_fix(cmd: str) -> str:
     """Nudge POSIX-isms into classic cmd.exe builtins."""
     cmd = re.sub(r"\s*2>\s*/dev/null\b", " 2>nul", cmd)
@@ -635,6 +661,7 @@ def _windows_cmd_compat_fix(cmd: str) -> str:
             toks[0] = alias
             cmd = " ".join(toks)
     cmd = re.sub(r"(?<!\S)grep\s+(-\w+\s+)*", "findstr ", cmd)
+    cmd = _fix_forfiles_size(cmd)
     return cmd
 
 
@@ -828,9 +855,12 @@ sorts by size. Suppress errors with `2>nul`. cmd has no real pipeline maths --
 keep commands simple.
 
 findstr matches TEXT in a line, never a number range -- NEVER use it to filter
-by file size or date. To filter files by size, use `forfiles` with `@fsize`
-(bytes): 1 KB=1024, 1 MB=1048576, 1 GB=1073741824. e.g. larger than 3 GB is
-`@fsize GEQ 3221225472`, larger than 500 MB is `@fsize GEQ 524288000`.
+by file size or date. To filter files by size use `forfiles` with `@fsize`
+(bytes): 1 KB=1024, 1 MB=1048576, 1 GB=1073741824 (3 GB = 3221225472,
+500 MB = 524288000). The /C command MUST be exactly, with @path only ONCE:
+  /C "cmd /c if @fsize GEQ <bytes> echo @path (@fsize bytes)"
+cmd cannot do float maths, so report the size in bytes -- do not try to
+convert to GB.
 
 For "my IP address": ipconfig | findstr /C:"IPv4"
 For the current Wi-Fi network: netsh wlan show interfaces | findstr /C:"SSID"
@@ -839,10 +869,10 @@ For battery: wmic path Win32_Battery get EstimatedChargeRemaining
 Examples (user request -> exact command):
 Q: tell me my ip address, the date, and my battery level
 A: ipconfig | findstr /C:"IPv4" & date /t & wmic path Win32_Battery get EstimatedChargeRemaining
-Q: list all files larger than 3 gb
-A: forfiles /P C:\\ /S /M * /C "cmd /c if @fsize GEQ 3221225472 echo @fsize @path" 2>nul
+Q: list all files larger than 3 gb, show the size
+A: forfiles /P C:\\ /S /M * /C "cmd /c if @fsize GEQ 3221225472 echo @path (@fsize bytes)" 2>nul
 Q: find files bigger than 500mb in my Downloads folder
-A: forfiles /P "%USERPROFILE%\\Downloads" /S /M * /C "cmd /c if @fsize GEQ 524288000 echo @fsize @path" 2>nul
+A: forfiles /P "%USERPROFILE%\\Downloads" /S /M * /C "cmd /c if @fsize GEQ 524288000 echo @path (@fsize bytes)" 2>nul
 Q: list the 10 largest files in my Downloads folder
 A: dir /a:-d /o:-s "%USERPROFILE%\\Downloads"
 Q: find all .py files in the current project
@@ -1107,6 +1137,32 @@ _SAFE_FILTER_CMDS = frozenset("awk column sort head tail wc uniq cat tr cut nl".
 # awk/sed program constructs that reach outside pure text formatting.
 _AWK_UNSAFE = re.compile(r"\b(?:system|getline|close|fflush|ENVIRON)\b|>|`|\|")
 
+# PowerShell: read-only source cmdlets (may lead a pipeline) and read-only
+# filter/format stages (may follow a pipe). Anything not listed -- ForEach-Object,
+# Copy-Item, Out-File, ... -- makes the command need a confirmation.
+_PS_READ_CMDLETS = frozenset(x.lower() for x in (
+    "Get-ChildItem gci ls dir Get-Content gc cat type Get-Item gi "
+    "Get-ItemProperty Get-Location pwd gl Get-Date Get-Process gps ps "
+    "Get-Service Get-ComputerInfo Get-Host Get-Volume Get-PSDrive "
+    "Get-Command gcm Get-Member gm Get-NetIPConfiguration Get-NetIPAddress "
+    "Get-CimInstance Get-WmiObject Get-Clipboard Get-Random Get-History "
+    "whoami hostname".split()
+))
+_PS_SAFE_FILTERS = frozenset(x.lower() for x in (
+    "Where-Object where ? Select-Object select Sort-Object sort "
+    "Measure-Object measure Format-Table ft Format-List fl Format-Wide fw "
+    "Format-Custom Group-Object group Out-String Out-Host Out-Default "
+    "Select-String sls Get-Unique ConvertTo-Json ConvertTo-Csv "
+    "ConvertTo-Html ConvertFrom-Json".split()
+))
+# Mutating cmdlet verbs -- if any appears (even inside a Where-Object block) the
+# command is not auto-run.
+_PS_MUTATING = re.compile(
+    r"(?i)(?<![\w-])(?:Remove|Set|Clear|New|Stop|Start|Restart|Move|Copy|"
+    r"Rename|Out-File|Export|Import|Invoke|Write|Add|Register|Unregister|"
+    r"Disable|Enable|Suspend|Resume|Send|Format-Volume|iex)-?\w*"
+)
+
 # stderr/stdout redirections to the bit-bucket -- harmless, stripped before the
 # redirect check so they don't disqualify an otherwise trivial command.
 _NULL_REDIR = re.compile(r"\s*\d?>&?\s*(?:/dev/null|[12])\b")
@@ -1126,13 +1182,34 @@ def is_trivial(command: str) -> bool:
     cmd = _NULL_REDIR.sub(" ", command.strip()).strip()
 
     if PROFILE.family == "windows":
-        # No POSIX find/date nuance here: a bare, single lookup with no pipe,
-        # chain, redirect, or sub-expression, whose verb is in the trivial set.
-        low = re.sub(r"\s*2>\s*nul\s*$", "", cmd, flags=re.I).strip()
-        if re.search(r"[|&<>`;]|\$\(|\$\{", low):
+        low = re.sub(r"\s*2>\s*(?:nul|\$null)\s*$", "", cmd, flags=re.I).strip()
+        if re.search(r"[<>`;&]|\$\(", low):
+            return False
+
+        if PROFILE.name == "windows-powershell":
+            # A read-only Get-* source, optionally piped through read-only
+            # filter/format stages. No mutating verb anywhere (covers blocks).
+            if _PS_MUTATING.search(low):
+                return False
+            stages = [s.strip() for s in low.split("|")]
+            if not stages[0]:
+                return False
+            first = stages[0].split()[0].lower()
+            if first not in _PS_READ_CMDLETS:
+                return False
+            for stage in stages[1:]:
+                toks = stage.split()
+                if not toks or toks[0].lower() not in (
+                    _PS_READ_CMDLETS | _PS_SAFE_FILTERS
+                ):
+                    return False
+            return True
+
+        # cmd.exe has no real pipelines -- a single bare lookup only.
+        if "|" in low:
             return False
         toks = low.split()
-        return bool(toks) and toks[0] in _TRIVIAL_CMDS
+        return bool(toks) and toks[0].lower() in {c.lower() for c in _TRIVIAL_CMDS}
 
     if re.search(r"[&<>`]|\$\(", cmd):
         return False
@@ -1367,6 +1444,12 @@ def _run_blocking(command: str, timeout: int) -> int:
         print(f"\nCommand timed out after {timeout}s and was killed.")
         logger.warning(f"TIMEOUT after {timeout}s: {command}")
         return 124
+    except KeyboardInterrupt:
+        # Ctrl-C reached us via the console; the child got it too and is
+        # stopping. Treat it as "stop this command", not "crash the REPL".
+        print("\n\033[2m[stopped -- back to AI-Shell]\033[0m")
+        logger.info(f"INTERRUPTED (Ctrl-C): {command}")
+        return 130
 
 
 def _run_interruptible(command: str, timeout: int) -> int:
@@ -1418,6 +1501,61 @@ def _run_interruptible(command: str, timeout: int) -> int:
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
 
 
+def _kill_tree_windows(proc: "subprocess.Popen") -> None:
+    """Kill the child and everything it spawned (taskkill /T)."""
+    try:
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        proc.terminate()
+    try:
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _run_interruptible_windows(command: str, timeout: int) -> int:
+    """Windows tty equivalent of _run_interruptible: poll the keyboard with
+    msvcrt; a lone ESC (or Ctrl-C) kills the command's process tree and
+    returns to the AI-Shell prompt.
+    """
+    target, use_shell = _exec_spec(command)
+    proc = subprocess.Popen(
+        target, shell=use_shell, stdin=subprocess.DEVNULL,
+        creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+    )
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            rc = proc.poll()
+            if rc is not None:
+                return rc
+            if time.monotonic() > deadline:
+                _kill_tree_windows(proc)
+                print(f"\nCommand timed out after {timeout}s and was killed.")
+                logger.warning(f"TIMEOUT after {timeout}s: {command}")
+                return 124
+            if msvcrt.kbhit():
+                ch = msvcrt.getwch()
+                if ch in ("\x00", "\xe0"):  # a function/arrow key -- drain, ignore
+                    msvcrt.getwch()
+                    continue
+                if ch not in ("\x1b", "\x03"):  # only ESC / Ctrl-C stop it
+                    continue
+                _kill_tree_windows(proc)
+                print("\n\033[2m[stopped -- back to AI-Shell]\033[0m")
+                logger.info(f"INTERRUPTED (ESC): {command}")
+                return 130
+            time.sleep(0.05)
+    except KeyboardInterrupt:
+        _kill_tree_windows(proc)
+        print("\n\033[2m[stopped -- back to AI-Shell]\033[0m")
+        logger.info(f"INTERRUPTED (Ctrl-C): {command}")
+        return 130
+
+
 def run_command(command: str, timeout: int = EXEC_TIMEOUT) -> int:
     """Execute a shell command, streaming its output, and return the exit code.
 
@@ -1426,10 +1564,14 @@ def run_command(command: str, timeout: int = EXEC_TIMEOUT) -> int:
     blocking run when stdin is not an interactive terminal.
     """
     ensure_logging()
-    interactive = termios is not None and sys.stdin.isatty()
+    tty_in = sys.stdin.isatty()
     try:
-        rc = _run_interruptible(command, timeout) if interactive \
-            else _run_blocking(command, timeout)
+        if tty_in and termios is not None:
+            rc = _run_interruptible(command, timeout)
+        elif tty_in and msvcrt is not None:
+            rc = _run_interruptible_windows(command, timeout)
+        else:
+            rc = _run_blocking(command, timeout)
     except (OSError, ValueError) as e:
         print(f"\nCould not execute command: {e}")
         logger.error(f"EXECUTION ERROR ({e}): {command}")
@@ -1569,6 +1711,8 @@ def read_request():
         first = input(f"\n[{_short_cwd()}] AI-Shell> ")
     except EOFError:
         return None
+    except KeyboardInterrupt:  # Ctrl-C at the prompt: quit cleanly, no traceback
+        return None
 
     fence = first.strip()
     if fence in ('"""', "'''", "```"):
@@ -1578,6 +1722,9 @@ def read_request():
                 ln = input("...> ")
             except EOFError:
                 break
+            except KeyboardInterrupt:  # abandon the block, back to the prompt
+                print("^C")
+                return ""
             if ln.strip() == fence:  # closing fence ends the request
                 break
             block.append(ln)
@@ -1591,6 +1738,9 @@ def read_request():
             lines.append(input("...> "))
         except EOFError:
             break
+        except KeyboardInterrupt:
+            print("^C")
+            return ""
     return " ".join(part.strip() for part in lines).strip()
 
 
@@ -1657,16 +1807,25 @@ def main():
     _print_banner()
     while True:
         request = read_request()
-        if request is None:  # Ctrl-D
-            print()
+        if request is None:  # Ctrl-D or Ctrl-C at the prompt
+            print("\nbye 👋")
             break
         request = request.strip()
         if not request:
             continue
         if request.lower() in ("exit", "quit"):
+            print("bye 👋")
             break
-        handle_query(request)
+        try:
+            handle_query(request)
+        except KeyboardInterrupt:
+            # Ctrl-C during model generation / a command: drop this request,
+            # return to the prompt instead of unwinding the whole program.
+            print("\n\033[2m[interrupted -- back to AI-Shell]\033[0m")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)

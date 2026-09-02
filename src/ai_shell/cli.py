@@ -39,22 +39,25 @@ def main(argv=None) -> None:
     # Import deferred so `--help` / `--version` never touch the model stack.
     from . import app
 
-    if not args.request:
-        app.main()  # <-- plain `ai-shell` opens the interactive REPL
-        return
+    try:
+        if not args.request:
+            app.main()  # <-- plain `ai-shell` opens the interactive REPL
+            return
 
-    query = " ".join(args.request)
-    app.ensure_logging()
-    if args.print_only:
-        app.get_local_model()
-        try:
-            print(app.get_shell_command(query))
-        except Exception as exc:  # noqa: BLE001 - surface a clean message
-            sys.exit(f"ai-shell: {exc}")
-    else:
-        app.load_history()
-        app.get_local_model()
-        app.handle_query(query)
+        query = " ".join(args.request)
+        app.ensure_logging()
+        if args.print_only:
+            app.get_local_model()
+            try:
+                print(app.get_shell_command(query))
+            except Exception as exc:  # noqa: BLE001 - surface a clean message
+                sys.exit(f"ai-shell: {exc}")
+        else:
+            app.load_history()
+            app.get_local_model()
+            app.handle_query(query)
+    except KeyboardInterrupt:  # Ctrl-C: exit quietly, no Python traceback
+        sys.exit(130)
 
 
 if __name__ == "__main__":

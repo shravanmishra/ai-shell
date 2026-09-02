@@ -71,7 +71,14 @@ def test_windows_powershell_profile():
         assert app.compat_fix("ls") == "Get-ChildItem"
         assert app.compat_fix("cat notes.txt") == "Get-Content notes.txt"
         assert app.is_trivial("Get-ChildItem") is True
+        # a read-only Get-* pipeline auto-runs; a mutating stage does not
+        assert app.is_trivial(
+            "Get-ChildItem C:\\ -Recurse -File | Where-Object Length -gt 3GB "
+            "| Select-Object FullName, Length"
+        ) is True
         assert app.is_trivial("Get-ChildItem | Remove-Item") is False
+        assert app.is_trivial("Get-ChildItem | ForEach-Object { Remove-Item $_ }") is False
+        assert app.is_trivial("Get-ChildItem | Out-File list.txt") is False
         assert app.classify_command("Remove-Item -Recurse -Force C:\\tmp")[0] == "danger"
         assert app.classify_command("Get-ChildItem C:\\")[0] == "ok"
         target, use_shell = app._exec_spec("Get-ChildItem")
@@ -84,11 +91,25 @@ def test_windows_cmd_profile():
         # size filtering must go through forfiles/@fsize, never findstr
         assert "forfiles" in app.SYSTEM_PROMPT and "@fsize" in app.SYSTEM_PROMPT
         assert app.compat_fix("cat x.txt") == "type x.txt"
+        # a mangled forfiles /C payload is normalised to the known-good form
+        bad = ('forfiles /P C:\\ /S /M * /C '
+               '"cmd /c if @fsize GEQ 1073741824 echo @fsize /@fsize" 2>nul')
+        fixed = app.compat_fix(bad)
+        assert fixed.count("@path") == 1
+        assert "@fsize GEQ 1073741824 echo @path (@fsize bytes)" in fixed
         assert app.compat_fix("ls") == "dir"
         assert app.is_trivial("dir") is True
         assert app.classify_command("del /q C:\\*")[0] == "danger"
         assert app.classify_command("rd /s /q C:\\build")[0] == "danger"
         assert app._exec_spec("dir") == ("dir", True)
+
+
+def test_run_blocking_swallows_ctrl_c(monkeypatch):
+    def boom(*a, **k):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(app.subprocess, "run", boom)
+    # Ctrl-C during a command must return 130, not propagate a traceback.
+    assert app._run_blocking("sleep 100", 5) == 130
 
 
 def test_detect_windows_shell(monkeypatch):
