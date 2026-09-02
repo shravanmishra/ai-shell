@@ -331,6 +331,9 @@ output, never just the bare number.
 
 If the request filters by a size in a human unit ("files larger than 3gb",
 "bigger than 500mb"), report each match's size in THAT unit, not raw bytes.
+
+Combined / total size of a set of files: pass them to `du -ch` -- it prints each
+file's size AND a final `total` line. For ONLY the total, append `| tail -1`.
 """
 
 
@@ -682,6 +685,10 @@ Q: show a table of the 15 biggest files with size and modified date
 A: find / -type f -size +1G -exec stat -f "%z  %Sm  %N" {} \\; 2>/dev/null | sort -rn | head -n 15 | column -t
 Q: show the top 5 largest directories in the current folder
 A: du -d 1 -h . | sort -rh | head -n 5
+Q: list every .txt file with its size and the combined total
+A: find . -type f -name "*.txt" -exec du -ch {} + 2>/dev/null
+Q: total size of all .log files here
+A: find . -type f -name "*.log" -exec du -ch {} + 2>/dev/null | tail -1
 Q: list all folders here
 A: ls -d */""",
     danger_extra=(),
@@ -723,6 +730,10 @@ Q: show a table of the 15 biggest files with size and modified date
 A: find / -type f -size +1G -exec stat -c "%s  %y  %n" {} \\; 2>/dev/null | sort -rn | head -n 15 | column -t
 Q: show the top 5 largest directories in the current folder
 A: du -h --max-depth=1 . | sort -rh | head -n 5
+Q: list every .txt file with its size and the combined total
+A: find . -type f -name "*.txt" -exec du -ch {} + 2>/dev/null
+Q: total size of all .log files here
+A: find . -type f -name "*.log" -exec du -ch {} + 2>/dev/null | tail -1
 Q: list all folders here
 A: ls -d */""",
     danger_extra=(
@@ -776,6 +787,10 @@ Q: show a table of the 15 biggest files with size and modified date
 A: Get-ChildItem C:\\ -Recurse -File -ErrorAction SilentlyContinue | Sort-Object Length -Descending | Select-Object -First 15 Name, Length, LastWriteTime | Format-Table
 Q: show the top 5 largest directories in the current folder
 A: Get-ChildItem -Directory | Select-Object Name, @{n='MB';e={[math]::Round((Get-ChildItem $_.FullName -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum/1MB,1)}} | Sort-Object MB -Descending | Select-Object -First 5
+Q: total size of all .txt files here
+A: "{0:N2} MB" -f ((Get-ChildItem -Recurse -File -Filter *.txt -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum / 1MB)
+Q: list every .txt file with its size and the combined total
+A: $f = Get-ChildItem -Recurse -File -Filter *.txt -ErrorAction SilentlyContinue; $f | Select-Object FullName, Length; "TOTAL {0:N2} MB" -f (($f | Measure-Object Length -Sum).Sum / 1MB)
 Q: list all folders here
 A: Get-ChildItem -Directory""",
     danger_extra=(
