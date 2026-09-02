@@ -158,6 +158,20 @@ def test_refine_on_failure(monkeypatch):
     assert "exit 2" in turns[1]["content"] and "No such file" in turns[1]["content"]
 
 
+def test_refine_failure_prompt_accepts_a_hint(monkeypatch):
+    calls = _script_gsc(monkeypatch, ["ls /nope", "ls ."])
+    monkeypatch.setattr(app, "run_command",
+                        lambda c, *a, **k: 2 if c == "ls /nope" else 0)
+    monkeypatch.setattr(app, "confirm_command", lambda c: True)
+    monkeypatch.setattr("builtins.input", lambda *_: "look in the current directory")
+
+    app.handle_query("show that file")
+
+    assert len(calls) == 2   # the free-text answer is treated as "yes, + hint"
+    fb = calls[1]["extra_turns"][1]["content"]
+    assert "Hint: look in the current directory" in fb
+
+
 def test_refine_on_rejection(monkeypatch):
     calls = _script_gsc(monkeypatch, ["du -ah .", "find ~/Downloads -type f"])
     monkeypatch.setattr(app, "run_command", lambda c, *a, **k: 0)

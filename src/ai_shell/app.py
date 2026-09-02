@@ -1793,12 +1793,17 @@ def handle_query(query: str) -> None:
         rc = run_command(command)  # our own buffered prints land after its output
         if rc in (0, 130) or last_attempt:
             break
-        if input(f"\n\033[2m↻ that exited {rc}. Ask the model to fix it? "
-                 f"(y/N)\033[0m ").strip().lower() != "y":
+        ans = input(
+            f"\n\033[2m↻ that exited {rc}. Fix it? (y/N, or type a hint)\033[0m "
+        ).strip()
+        if not ans or ans.lower() in ("n", "no"):
             break
+        hint = "" if ans.lower() in ("y", "yes") else ans
         fb = f"That command failed (exit {rc})."
         if _LAST_RUN.get("command") == command and _LAST_RUN.get("output"):
             fb += "\nOutput:\n" + _LAST_RUN["output"]
+        if hint:
+            fb += f"\nHint: {hint}"
         fb += "\nGive a corrected command for the same request."
         nxt = _refine(query, command, fb)
         if nxt is None:

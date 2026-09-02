@@ -45,9 +45,11 @@ ai-shell -m mlx-community/Qwen2.5-Coder-7B-Instruct-4bit   # bigger model
 - While a command runs, **ESC** stops it and returns you to the prompt.
 - Multi-line: end a line with `\`, or wrap a block in `"""`.
 - **Refine on failure:** if a command exits non-zero, or you reject it, ai-shell
-  offers to hand the error (or a one-line hint you type) back to the model for a
-  corrected command — up to `SHELLAI_REFINE_MAX` times (default 2). Set
-  `SHELLAI_NO_REFINE=1` to turn it off. Still one model, still confirms every step.
+  hands the error back to the model for a corrected command. At the `↻ Fix it?`
+  prompt (and the rejection prompt) you can just press `y`/Enter, or type a hint
+  ("look in ~/Downloads", "use ripgrep") that's passed along too. Up to
+  `SHELLAI_REFINE_MAX` rounds (default 2); `SHELLAI_NO_REFINE=1` turns it off.
+  Still one model, still confirms every step.
 
 ## Platforms
 
