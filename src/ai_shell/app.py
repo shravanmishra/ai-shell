@@ -1594,16 +1594,67 @@ def read_request():
     return " ".join(part.strip() for part in lines).strip()
 
 
+_BANNER_ART = r"""
+ █████╗ ██╗    ███████╗██╗  ██╗███████╗██╗     ██╗
+██╔══██╗██║    ██╔════╝██║  ██║██╔════╝██║     ██║
+███████║██║    ███████╗███████║█████╗  ██║     ██║
+██╔══██║██║    ╚════██║██╔══██║██╔══╝  ██║     ██║
+██║  ██║██║    ███████║██║  ██║███████╗███████╗███████╗
+╚═╝  ╚═╝╚═╝    ╚══════╝╚═╝  ╚═╝╚══════╝╚══════╝╚══════╝
+"""
+
+
+def _print_banner() -> None:
+    """A big AI-SHELL wordmark + an info box, Claude-Code style.
+
+    Falls back to a one-liner if the terminal can't encode the box-drawing
+    glyphs (legacy Windows code pages) or SHELLAI_NO_BANNER is set.
+    """
+    if os.environ.get("SHELLAI_NO_BANNER") or (
+        (sys.stdout.encoding or "").lower() not in ("utf-8", "utf8", "cp65001")
+    ):
+        print(f"AI-SHELL  --  local shell copilot ({PROFILE.os_label})")
+        return
+
+    use_color = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+    def c(text: str, code: str) -> str:
+        return f"\033[{code}m{text}\033[0m" if use_color else text
+
+    for line in _BANNER_ART.strip("\n").splitlines():
+        print(c(line, "38;5;44"))  # teal
+    print(c("  🐚  local shell copilot", "1") +
+          c("  ·  nothing leaves your machine", "2"))
+
+    w = 54  # inner width of the box (ASCII-only so padding is exact everywhere)
+    rows = [
+        c("platform ", "2") + PROFILE.os_label,
+        c("model    ", "2") + MODEL_REPO.split("/")[-1],
+        "",
+        c('multi-line: end a line with \\  or wrap a block in """', "2"),
+        c('ESC stops a running command  ·  type "exit" to quit', "2"),
+    ]
+    if history:
+        rows.append(c(f"resumed {len(history)} messages from history", "2"))
+
+    def pad(s: str) -> str:
+        vis = len(re.sub(r"\033\[[0-9;]*m", "", s))
+        return s + " " * max(0, w - vis)
+
+    dim = "2"
+    print()
+    print(c("╭" + "─" * (w + 2) + "╮", dim))
+    for r in rows:
+        print(c("│ ", dim) + pad(r) + c(" │", dim))
+    print(c("╰" + "─" * (w + 2) + "╯", dim))
+
+
 def main():
     ensure_logging()
     load_history()
     get_local_model()
     seed_readline_history()
-    print(f"--- Mini Local Shell AI Initialized ({PROFILE.os_label}) ---")
-    print('(multi-line: end a line with \\ , or wrap a block in """ ; "exit" to quit)')
-    print("(while a command runs, press ESC to stop it and return here)")
-    if history:
-        print(f"(Resumed {len(history)} previous messages from history)")
+    _print_banner()
     while True:
         request = read_request()
         if request is None:  # Ctrl-D
