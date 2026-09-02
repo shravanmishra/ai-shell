@@ -125,6 +125,19 @@ def test_run_blocking_swallows_ctrl_c(monkeypatch):
     assert app._run_blocking("sleep 100", 5) == 130
 
 
+def test_fix_find_exec_terminator():
+    f = app.fix_find_exec_terminator
+    assert f(r"find / -type f -size +50M -exec ls -lh {} \ 2>/dev/null") == \
+        r"find / -type f -size +50M -exec ls -lh {} \; 2>/dev/null"
+    assert f(r"find . -type f -exec ls -lh {} ;") == r"find . -type f -exec ls -lh {} \;"
+    assert f(r"find /var -type f -exec stat {} 2>/dev/null") == \
+        r"find /var -type f -exec stat {} \; 2>/dev/null"
+    # already valid -- untouched
+    assert f(r'find . -name "*.py" -exec wc -l {} \;') == r'find . -name "*.py" -exec wc -l {} \;'
+    assert f(r"find . -exec grep foo {} +") == r"find . -exec grep foo {} +"
+    assert f(r'find . -name "*.log"') == r'find . -name "*.log"'
+
+
 def test_quote_spaced_path(tmp_path, monkeypatch):
     d = tmp_path / "Application Support" / "CloudDocs"
     d.mkdir(parents=True)

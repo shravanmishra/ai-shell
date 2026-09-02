@@ -477,6 +477,23 @@ def quiet_broad_find(command: str) -> str:
     return command
 
 
+def fix_find_exec_terminator(cmd: str) -> str:
+    """Repair a `find ... -exec CMD {}` whose `\\;` (or `+`) terminator the model
+    mangled: `{} \\` / `{} \\ 2>/dev/null` (dangling backslash), a bare `{} ;`
+    that the shell would eat, or `{}` with no terminator at all before a
+    redirect / pipe / end of line. All -> `{} \\;`.
+    """
+    if "-exec" not in cmd:
+        return cmd
+    # `{} \` where the backslash is NOT already `\;`
+    cmd = re.sub(r"(\{\}\s*)\\(?!;)(\s|$)", r"\1\\;\2", cmd)
+    # bare, unescaped `{} ;`
+    cmd = re.sub(r"(\{\}\s*)(?<!\\);(\s|$)", r"\1\\;\2", cmd)
+    # `{}` immediately followed by a redirect / pipe / EOL and no `\;` or `+`
+    cmd = re.sub(r"(\{\})(\s*)(?=$|[|&]|\d*>)", r"\1 \\;\2", cmd)
+    return cmd
+
+
 def repair_command(cmd: str) -> str:
     """Deterministic repair for common 1.5B-model mistakes.
 
@@ -1315,7 +1332,8 @@ def get_shell_command(user_query: str, extra_turns: list[dict] | None = None) ->
     raw = raw.strip()
     extracted = extract_command(raw)
     if PROFILE.family == "posix":
-        command = repair_command(extracted)
+        command = fix_find_exec_terminator(extracted)
+        command = repair_command(command)
         command = compat_fix(command)
         command = fix_stat_format_escapes(command)
         command = fix_size_unit_math(command)

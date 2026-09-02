@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ai-shell-cli"
-version = "1.0.0b12"
+version = "1.0.0b13"
 description = "Natural-language -> shell command translator running a local LLM"
 readme = "README.md"
 requires-python = ">=3.10"
