@@ -265,6 +265,21 @@ def test_refine_budget(monkeypatch):
     assert len(calls) == 2        # initial + exactly one refine, then stop
 
 
+def test_windows_current_directory(monkeypatch):
+    monkeypatch.setattr(app.os, "chdir", lambda p: None)  # don't move the test cwd
+    with _with_profile("windows-cmd"):
+        assert app.compat_fix("cd /d %cd%") == "cd"
+        assert app.compat_fix("cd %cd%") == "cd"
+        # bare `cd` PRINTS the cwd on cmd -- must run, not chdir to home
+        assert app.apply_cd("cd") == (False, "cd")
+    with _with_profile("windows-powershell"):
+        assert app.compat_fix("cd /d %cd%") == "Get-Location"
+        assert app.apply_cd("Get-Location") == (False, "Get-Location")
+    with _with_profile("linux"):
+        # POSIX bare `cd` still means "go home", handled in-process
+        assert app.apply_cd("cd")[0] is True
+
+
 def test_detect_windows_shell(monkeypatch):
     monkeypatch.setenv("SHELLAI_SHELL", "cmd")
     assert app._detect_windows_shell() == "cmd"

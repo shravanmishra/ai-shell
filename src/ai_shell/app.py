@@ -574,6 +574,9 @@ def _windows_ps_compat_fix(cmd: str) -> str:
     # Strip POSIX stderr-to-null; PowerShell uses -ErrorAction instead.
     cmd = re.sub(r"\s*2>\s*/dev/null\b", "", cmd)
     cmd = re.sub(r"\s*2>\s*nul\b", "", cmd, flags=re.I)
+    # "where am I" -> `cd /d %cd%` (a cmd no-op) / `echo %cd%` -> Get-Location
+    if re.fullmatch(r"\s*(?:cd(?:\s+/d)?\s+%cd%|echo\s+%cd%)\s*", cmd, re.I):
+        return "Get-Location"
     # `find . -name "*.py"` (and -iname) -> Get-ChildItem -Recurse -Filter
     m = re.match(
         r'find\s+(\S+)\s+(?:-type\s+f\s+)?-i?name\s+["\']?([^"\']+)["\']?\s*$', cmd
@@ -622,6 +625,10 @@ def _fix_forfiles_size(cmd: str) -> str:
 def _windows_cmd_compat_fix(cmd: str) -> str:
     """Nudge POSIX-isms into classic cmd.exe builtins."""
     cmd = re.sub(r"\s*2>\s*/dev/null\b", " 2>nul", cmd)
+    # "where am I": the model emits `cd /d %cd%` / `cd %cd%`, which is a no-op
+    # that prints nothing. Bare `cd` prints the working directory.
+    if re.fullmatch(r"\s*cd(?:\s+/d)?\s+%cd%\s*", cmd, re.I):
+        return "cd"
     toks = cmd.split()
     if toks:
         alias = {
@@ -792,7 +799,9 @@ A: "{0:N2} MB" -f ((Get-ChildItem -Recurse -File -Filter *.txt -ErrorAction Sile
 Q: list every .txt file with its size and the combined total
 A: $f = Get-ChildItem -Recurse -File -Filter *.txt -ErrorAction SilentlyContinue; $f | Select-Object FullName, Length; "TOTAL {0:N2} MB" -f (($f | Measure-Object Length -Sum).Sum / 1MB)
 Q: list all folders here
-A: Get-ChildItem -Directory""",
+A: Get-ChildItem -Directory
+Q: what is my current directory
+A: Get-Location""",
     danger_extra=(
         (re.compile(_B_WIN + r"(?:Remove-Item|ri|rm|del|erase|rd|rmdir)(?![\w-])",
                     re.I | re.S), "deletes files or folders"),
@@ -866,6 +875,8 @@ Q: show all files in this folder with size and date
 A: dir /a:-d
 Q: list all folders here
 A: dir /a:d /b
+Q: what is my current directory
+A: cd
 Q: what's my computer name and windows version
 A: hostname & ver""",
     danger_extra=(
@@ -1728,6 +1739,10 @@ def apply_cd(command: str):
         command.strip(), re.I,
     )
     if not m:
+        return False, command
+    # On Windows cmd, a bare `cd` PRINTS the working directory -- let it run
+    # rather than chdir'ing to home (POSIX semantics).
+    if PROFILE.family == "windows" and not m.group(1) and not m.group(2):
         return False, command
     target = _resolve_cd_target(m.group(1))
     try:
