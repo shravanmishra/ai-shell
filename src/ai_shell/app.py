@@ -314,6 +314,10 @@ Scope rules (very important):
 - If the user names a specific directory (e.g. Downloads, ~/Documents, /var/log),
   use that path.
 - If the user says "in this folder", "here", or "current directory", use . .
+- A folder/file name the user gives you is literal data, never a word to
+  autocorrect or expand to a similar-looking dictionary word. "rnd" means a
+  folder literally named rnd, NOT "random"; "cfg" is not "config" unless the
+  user wrote that out. Copy such names byte-for-byte into the path.
 
 IMPORTANT: find outputs one bare path per line. To get size/date, you MUST use
 -exec stat or -exec ls. NEVER pipe bare find output into awk to extract
@@ -352,6 +356,10 @@ Scope rules (very important):
   folder, start from the drive root (C:\\), NOT the current directory.
 - If the user names a specific directory, use that path.
 - If the user says "in this folder", "here", or "current directory", use "." .
+- A folder/file name the user gives you is literal data, never a word to
+  autocorrect or expand to a similar-looking dictionary word. "rnd" means a
+  folder literally named rnd, NOT "random"; "cfg" is not "config" unless the
+  user wrote that out. Copy such names byte-for-byte into the path.
 
 Multiple asks: if ONE request bundles several unrelated questions ("my IP and
 the wifi name and the battery and the time"), join the commands with ; so every
@@ -697,7 +705,9 @@ A: find . -type f -name "*.txt" -exec du -ch {} + 2>/dev/null
 Q: total size of all .log files here
 A: find . -type f -name "*.log" -exec du -ch {} + 2>/dev/null | tail -1
 Q: list all folders here
-A: ls -d */""",
+A: ls -d */
+Q: go to rnd
+A: cd rnd""",
     danger_extra=(),
     trivial_cmds=frozenset(
         "ls pwd clear echo whoami hostname uptime uname cal id sw_vers df date find".split()
@@ -742,7 +752,9 @@ A: find . -type f -name "*.txt" -exec du -ch {} + 2>/dev/null
 Q: total size of all .log files here
 A: find . -type f -name "*.log" -exec du -ch {} + 2>/dev/null | tail -1
 Q: list all folders here
-A: ls -d */""",
+A: ls -d */
+Q: go to rnd
+A: cd rnd""",
     danger_extra=(
         (re.compile(r"(?:^|(?<=[\s;&|(]))(?:apt|apt-get|dnf|yum|pacman|snap)\b.*"
                     r"\b(?:remove|purge|autoremove|-R\w*)\b", re.S | re.I),
@@ -801,7 +813,9 @@ A: $f = Get-ChildItem -Recurse -File -Filter *.txt -ErrorAction SilentlyContinue
 Q: list all folders here
 A: Get-ChildItem -Directory
 Q: what is my current directory
-A: Get-Location""",
+A: Get-Location
+Q: go to rnd
+A: Set-Location rnd""",
     danger_extra=(
         (re.compile(_B_WIN + r"(?:Remove-Item|ri|rm|del|erase|rd|rmdir)(?![\w-])",
                     re.I | re.S), "deletes files or folders"),
@@ -878,7 +892,9 @@ A: dir /a:d /b
 Q: what is my current directory
 A: cd
 Q: what's my computer name and windows version
-A: hostname & ver""",
+A: hostname & ver
+Q: go to rnd
+A: cd rnd""",
     danger_extra=(
         (re.compile(_B_WIN + r"(?:del|erase)(?![\w-])", re.I | re.S),
          "deletes files (del)"),
