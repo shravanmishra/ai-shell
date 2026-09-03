@@ -1409,7 +1409,7 @@ def looks_malformed(command: str):
         return True, "empty"
     if cmd.endswith("\\"):
         return True, "ends with a bare line-continuation backslash"
-    if re.search(r"(\|\|?|&&?|;)\s*$", cmd):
+    if re.search(r"(\|\|?|&&?|(?<!\\);)\s*$", cmd):
         return True, "ends with a dangling shell operator"
 
     # Model degeneration: fed several requests at once, the 1.5B often loops,
