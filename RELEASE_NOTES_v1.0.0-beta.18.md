@@ -7,6 +7,10 @@ Natural-language → shell command translator running a **local** LLM.
 - **Docs only.** Added a Windows `CERTIFICATE_VERIFY_FAILED` / SSL cert error
   troubleshooting section to the install instructions (corporate proxy/AV SSL
   inspection is the usual cause). No functional changes.
+- **Model file attached to this release.** The `llama` backend's GGUF weights
+  (`Qwen2.5-Coder-1.5B-Instruct-Q4_K_M.gguf`, ~940MB) are now a downloadable
+  asset on this release, for machines that can reach github.com but not
+  huggingface.co. See "Offline model install" below.
 
 ## Install
 
@@ -55,6 +59,29 @@ pipx install --force `
 ```
 
 Also check the system clock — a wrong date triggers the same error.
+
+### Offline model install (`llama` backend)
+
+On first run, ai-shell downloads the GGUF model from HuggingFace Hub. If that
+network path is blocked but github.com isn't, grab
+`Qwen2.5-Coder-1.5B-Instruct-Q4_K_M.gguf` from this release's assets instead
+and drop it in the cache dir yourself — ai-shell finds it there and skips the
+download entirely:
+
+```powershell
+# Windows
+mkdir "$env:USERPROFILE\.cache\ai-shell\gguf" -Force
+Move-Item Qwen2.5-Coder-1.5B-Instruct-Q4_K_M.gguf "$env:USERPROFILE\.cache\ai-shell\gguf\"
+```
+
+```bash
+# macOS / Linux
+mkdir -p ~/.cache/ai-shell/gguf
+mv Qwen2.5-Coder-1.5B-Instruct-Q4_K_M.gguf ~/.cache/ai-shell/gguf/
+```
+
+(Setting `XDG_CACHE_HOME` moves the whole cache dir; `SHELLAI_GGUF_FILE` changes
+just the expected filename — set both to non-default values consistently.)
 
 ## Verify (optional)
 
