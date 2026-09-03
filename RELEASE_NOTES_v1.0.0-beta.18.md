@@ -10,6 +10,20 @@ Natural-language → shell command translator running a **local** LLM.
 
 ## Install
 
+Straight from this GitHub release (no manual download needed):
+
+```bash
+# macOS, Apple Silicon
+pipx install --force "ai-shell-cli[mlx] @ https://github.com/shravanmishra/ai-shell/releases/download/v1.0.0-beta.18/ai_shell_cli-1.0.0b18-py3-none-any.whl"
+
+# Windows / Linux / Intel Mac  (prebuilt llama.cpp wheel, no compiler needed)
+pipx install --force \
+  --pip-args "--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu" \
+  "ai-shell-cli[llama] @ https://github.com/shravanmishra/ai-shell/releases/download/v1.0.0-beta.18/ai_shell_cli-1.0.0b18-py3-none-any.whl"
+```
+
+Or from a wheel you already downloaded (e.g. from this release's assets):
+
 ```bash
 # macOS, Apple Silicon
 pipx install --force "/path/to/ai_shell_cli-1.0.0b18-py3-none-any.whl[mlx]"
