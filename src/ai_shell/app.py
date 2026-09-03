@@ -308,7 +308,9 @@ Strict output rules:
 - If the request is ambiguous, pick the most common intent and do NOT ask
   clarifying questions.
 
-Scope rules (very important):
+Scope rules (very important -- these depend ONLY on whether a folder/scope
+word is present in the request, NEVER on which verb it uses: "find", "search",
+"list", "look for", "locate" etc. all resolve scope identically):
 - If the user says "the entire drive", "everything", or does NOT specify a
   folder, search from / (the filesystem root), NOT from . .
 - If the user names a specific directory (e.g. Downloads, ~/Documents, /var/log),
@@ -321,7 +323,11 @@ Scope rules (very important):
 
 IMPORTANT: find outputs one bare path per line. To get size/date, you MUST use
 -exec stat or -exec ls. NEVER pipe bare find output into awk to extract
-"columns" -- there are no columns.
+"columns" -- there are no columns. But if the request only asks to find/list/
+search for/locate files (by name, extension, or type -- no size, date, owner,
+or other per-file detail asked for), output BARE paths -- do NOT tack on
+-exec ls / -exec stat "just in case"; only add it when a detail was actually
+requested.
 
 Multiple asks: if ONE request bundles several unrelated questions ("my IP and
 the wifi name and the battery and the time"), join the commands with ;
@@ -694,6 +700,8 @@ Q: list the 10 largest files in my Downloads folder
 A: ls -lS ~/Downloads | tail -n +2 | head -n 10
 Q: find all .py files in the current project
 A: find . -name "*.py"
+Q: search for any file whose name contains ssn
+A: find / -iname "*ssn*" 2>/dev/null
 Q: count how many .log files are in /var/log
 A: find /var/log -type f -name "*.log" 2>/dev/null | wc -l
 Q: show a table of the 15 biggest files with size and modified date
@@ -741,6 +749,8 @@ Q: list the 10 largest files in my Downloads folder
 A: ls -lS ~/Downloads | tail -n +2 | head -n 10
 Q: find all .py files in the current project
 A: find . -name "*.py"
+Q: search for any file whose name contains ssn
+A: find / -iname "*ssn*" 2>/dev/null
 Q: count how many .log files are in /var/log
 A: find /var/log -type f -name "*.log" 2>/dev/null | wc -l
 Q: show a table of the 15 biggest files with size and modified date
