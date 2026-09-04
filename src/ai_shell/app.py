@@ -344,6 +344,12 @@ If the request filters by a size in a human unit ("files larger than 3gb",
 
 Combined / total size of a set of files: pass them to `du -ch` -- it prints each
 file's size AND a final `total` line. For ONLY the total, append `| tail -1`.
+
+Discarding uncommitted changes ("wipe out my changes", "discard everything",
+"reset my working directory") means `git reset --hard` (tracked files) plus
+`git clean -fd` (untracked files) -- NEVER include `rm -rf .git` or anything
+that deletes the .git directory itself; that destroys the entire repository's
+history, not just the uncommitted changes that were actually asked for.
 """
 
 
@@ -387,6 +393,12 @@ part runs.
 
 If the request filters by a size in a human unit ("files larger than 3gb",
 "bigger than 500mb"), report each match's size in THAT unit, not raw bytes.
+
+Discarding uncommitted changes ("wipe out my changes", "discard everything",
+"reset my working directory") means `git reset --hard` (tracked files) plus
+`git clean -fd` (untracked files) -- NEVER delete the .git folder itself
+(e.g. Remove-Item -Recurse .git); that destroys the entire repository's
+history, not just the uncommitted changes that were actually asked for.
 """
 
 
@@ -413,7 +425,10 @@ def extract_command(raw: str) -> str:
 
     # A fenced code block anywhere in the reply is the command; trust its full
     # body so multi-line commands survive, and ignore any surrounding prose.
-    fence = re.search(r"```(?:bash|sh|shell|zsh)?[ \t]*\n?(.*?)```", text, re.S)
+    fence = re.search(
+        r"```(?:bash|sh|shell|zsh|powershell|pwsh|ps1|cmd|batch|bat)?[ \t]*\n?(.*?)```",
+        text, re.S,
+    )
     if fence:
         body = fence.group(1).strip()
         body = re.sub(r"^(?:A|Answer|Command|Output)\s*:\s*", "", body, flags=re.I)
@@ -729,7 +744,9 @@ A: find . -type f -name "*.log" -exec du -ch {} + 2>/dev/null | tail -1
 Q: list all folders here
 A: ls -d */
 Q: go to rnd
-A: cd rnd""",
+A: cd rnd
+Q: wipe out all my uncommitted changes
+A: git reset --hard && git clean -fd""",
     danger_extra=(),
     trivial_cmds=frozenset(
         "ls pwd clear echo whoami hostname uptime uname cal id sw_vers df date find".split()
@@ -778,7 +795,9 @@ A: find . -type f -name "*.log" -exec du -ch {} + 2>/dev/null | tail -1
 Q: list all folders here
 A: ls -d */
 Q: go to rnd
-A: cd rnd""",
+A: cd rnd
+Q: discard all uncommitted changes and untracked files
+A: git reset --hard && git clean -fd""",
     danger_extra=(
         (re.compile(r"(?:^|(?<=[\s;&|(]))(?:apt|apt-get|dnf|yum|pacman|snap)\b.*"
                     r"\b(?:remove|purge|autoremove|-R\w*)\b", re.S | re.I),
@@ -841,7 +860,9 @@ A: Get-ChildItem -Directory
 Q: what is my current directory
 A: Get-Location
 Q: go to rnd
-A: Set-Location rnd""",
+A: Set-Location rnd
+Q: discard all uncommitted changes in this repo
+A: git reset --hard; git clean -fd""",
     danger_extra=(
         (re.compile(_B_WIN + r"(?:Remove-Item|ri|rm|del|erase|rd|rmdir)(?![\w-])",
                     re.I | re.S), "deletes files or folders"),
@@ -924,7 +945,9 @@ A: cd
 Q: what's my computer name and windows version
 A: hostname & ver
 Q: go to rnd
-A: cd rnd""",
+A: cd rnd
+Q: discard all uncommitted changes in this repo
+A: git reset --hard && git clean -fd""",
     danger_extra=(
         (re.compile(_B_WIN + r"(?:del|erase)(?![\w-])", re.I | re.S),
          "deletes files (del)"),
@@ -1412,7 +1435,7 @@ column jq yq less more man which env sleep
 
 # Tokens that legitimately introduce another command name after them.
 _CMD_WRAPPERS = frozenset(
-    "xargs sudo time env nice ionice nohup watch command exec then else do".split()
+    "xargs sudo time env nice ionice nohup watch command which exec then else do".split()
 )
 
 # Commands that essentially never appear as a bare argument or grep pattern,
