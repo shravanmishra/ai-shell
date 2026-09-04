@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ai-shell-cli"
-version = "1.0.0b19"
+version = "1.0.0b20"
 description = "Natural-language -> shell command translator running a local LLM"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -50,6 +50,9 @@ Issues = "https://github.com/shravanmishra/ai-shell/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ai_shell"]
+
+[tool.hatch.build.targets.wheel.hooks.custom]
+path = "hatch_build.py"
 
 [tool.hatch.build.targets.sdist]
 include = ["/src/ai_shell", "/tests", "/README.md", "/LICENSE", "/pyproject.toml"]

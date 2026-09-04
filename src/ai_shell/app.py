@@ -200,8 +200,22 @@ def ensure_model_downloaded() -> None:
     print("Download complete.")
 
 
+def _bundled_gguf_path() -> str | None:
+    """Path to the GGUF if this install's wheel bundled it, else None."""
+    try:
+        import importlib.resources as res
+        candidate = res.files("ai_shell") / "gguf" / LLAMA_MODEL_FILE
+        return str(candidate) if candidate.is_file() else None
+    except (ModuleNotFoundError, FileNotFoundError):
+        return None
+
+
 def _ensure_gguf() -> str:
-    """Fetch the GGUF for the llama.cpp backend into the cache; return its path."""
+    """Return the GGUF path for the llama.cpp backend: bundled copy if this
+    install shipped one (see hatch_build.py), else fetch into the cache."""
+    bundled = _bundled_gguf_path()
+    if bundled:
+        return bundled
     if hf_hub_download is None:
         sys.exit("ai-shell: huggingface-hub is missing; reinstall the package.")
     gguf_dir = os.path.join(_user_dir("cache"), "gguf")
