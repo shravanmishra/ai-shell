@@ -28,6 +28,27 @@ downloads once on first run into `~/.cache/ai-shell/`.
 Backend selection is automatic (`SHELLAI_BACKEND=auto`): MLX when it's
 importable, otherwise llama.cpp. Force it with `SHELLAI_BACKEND=mlx|llama`.
 
+### Windows / Linux: the `[llama]` backend needs a prebuilt wheel
+
+`llama-cpp-python` has no C compiler bundled, so if `pip` can't find a matching
+prebuilt wheel it tries to **build from source** and fails with
+`CMAKE_C_COMPILER not set` / `nmake` errors. Two ways around it:
+
+```bash
+# 1. point pip at llama-cpp-python's own prebuilt-wheel index
+pipx install --force \
+  --pip-args "--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu" \
+  "ai-shell-cli[llama]"
+```
+
+- Prebuilt wheels exist only up to **Python 3.12** — on 3.13/3.14 there is no
+  wheel; install with a 3.12 interpreter (`pipx install --python python3.12 ...`).
+- CUDA build: swap `whl/cpu` for `whl/cu121` (or `cu122`, `cu124`).
+- Last resort — build it: install "Visual Studio Build Tools" with *Desktop
+  development with C++* + CMake, then retry the plain install.
+
+(macOS Apple Silicon has no build step: the `[mlx]` wheels are ready-made.)
+
 ## Use
 
 ```bash
@@ -44,6 +65,12 @@ ai-shell -m mlx-community/Qwen2.5-Coder-7B-Instruct-4bit   # bigger model
 - `cd` persists across turns; the prompt shows the current directory.
 - While a command runs, **ESC** stops it and returns you to the prompt.
 - Multi-line: end a line with `\`, or wrap a block in `"""`.
+- **Refine on failure:** if a command exits non-zero, or you reject it, ai-shell
+  hands the error back to the model for a corrected command. At the `↻ Fix it?`
+  prompt (and the rejection prompt) you can just press `y`/Enter, or type a hint
+  ("look in ~/Downloads", "use ripgrep") that's passed along too. Up to
+  `SHELLAI_REFINE_MAX` rounds (default 2); `SHELLAI_NO_REFINE=1` turns it off.
+  Still one model, still confirms every step.
 
 ## Platforms
 
@@ -71,9 +98,9 @@ and safety list:
 | `SHELLAI_MODEL_REPO` | `mlx-community/Qwen2.5-Coder-1.5B-Instruct-4bit` (MLX) |
 | `SHELLAI_GGUF_REPO` / `SHELLAI_GGUF_FILE` | `bartowski/Qwen2.5-Coder-1.5B-Instruct-GGUF` / `…-Q4_K_M.gguf` (llama.cpp) |
 | `SHELLAI_LLM_DIR` | `~/.cache/ai-shell/models` |
-| `SHELLAI_LOG_FILE` / `SHELLAI_HISTORY_FILE` | `~/.local/state/ai-shell/` |
-| `SHELLAI_PERSIST_HISTORY` | unset — history is per-session; each restart starts fresh. Set to `1` to carry it across restarts. |
+| `SHELLAI_LOG_FILE` | `~/.local/state/ai-shell/shellai.log` |
 | `SHELLAI_TIMEOUT` | `120` (seconds per command) |
+| `SHELLAI_REFINE_MAX` / `SHELLAI_NO_REFINE` | `2` retries on failure/rejection; set `SHELLAI_NO_REFINE=1` to disable |
 | `SHELLAI_PLATFORM` | auto-detected (`macos` \| `linux` \| `windows`) |
 | `SHELLAI_SHELL` | Windows only: `powershell` (default) \| `cmd` |
 

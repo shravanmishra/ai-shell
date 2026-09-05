@@ -2,7 +2,6 @@
 import os
 import re
 import sys
-import json
 import time
 import shutil
 import signal
@@ -64,6 +63,12 @@ LLM_DIR = os.environ.get("SHELLAI_LLM_DIR") or os.path.join(_user_dir("cache"), 
 MODEL_DIR = os.path.join(LLM_DIR, MODEL_REPO.split("/")[-1])
 MAX_TOKENS = int(os.environ.get("SHELLAI_MAX_TOKENS", "256"))
 EXEC_TIMEOUT = int(os.environ.get("SHELLAI_TIMEOUT", "120"))
+
+# Refine-on-failure: when a command exits non-zero or you reject it, ask the
+# model for a corrected command (feeding back the error / your hint). Bounded
+# by REFINE_MAX retries per request; NO_REFINE=1 disables it entirely.
+REFINE_MAX = int(os.environ.get("SHELLAI_REFINE_MAX", "2"))
+NO_REFINE = os.environ.get("SHELLAI_NO_REFINE", "").strip() not in ("", "0", "false")
 
 # Model backend: "auto" prefers MLX when importable (Apple Silicon) and
 # otherwise uses llama.cpp with a local GGUF -- which works on Linux and
@@ -195,8 +200,22 @@ def ensure_model_downloaded() -> None:
     print("Download complete.")
 
 
+def _bundled_gguf_path() -> str | None:
+    """Path to the GGUF if this install's wheel bundled it, else None."""
+    try:
+        import importlib.resources as res
+        candidate = res.files("ai_shell") / "gguf" / LLAMA_MODEL_FILE
+        return str(candidate) if candidate.is_file() else None
+    except (ModuleNotFoundError, FileNotFoundError):
+        return None
+
+
 def _ensure_gguf() -> str:
-    """Fetch the GGUF for the llama.cpp backend into the cache; return its path."""
+    """Return the GGUF path for the llama.cpp backend: bundled copy if this
+    install shipped one (see hatch_build.py), else fetch into the cache."""
+    bundled = _bundled_gguf_path()
+    if bundled:
+        return bundled
     if hf_hub_download is None:
         sys.exit("ai-shell: huggingface-hub is missing; reinstall the package.")
     gguf_dir = os.path.join(_user_dir("cache"), "gguf")
@@ -233,10 +252,11 @@ def get_local_model():
                      "or:  SHELLAI_BACKEND=llama ai-shell  (any OS)")
         if _model is None or _tokenizer is None:
             ensure_model_downloaded()
-            print(f"Loading local model from {MODEL_DIR} ...")
+            ensure_logging()
+            logger.info(f"Loading local model from {MODEL_DIR} ...")
             t0 = time.perf_counter()
             _model, _tokenizer = mlx_load(MODEL_DIR)
-            print(f"Model ready in {time.perf_counter() - t0:.1f}s")
+            logger.info(f"Model ready in {time.perf_counter() - t0:.1f}s")
         return _model, _tokenizer
 
     # backend == "llama"
@@ -246,10 +266,11 @@ def get_local_model():
                  "    pip install 'ai-shell-cli[llama]'")
     if _llama is None:
         path = _ensure_gguf()
-        print(f"Loading local model from {path} ...")
+        ensure_logging()
+        logger.info(f"Loading local model from {path} ...")
         t0 = time.perf_counter()
         _llama = _Llama(model_path=path, n_ctx=4096, verbose=False)
-        print(f"Model ready in {time.perf_counter() - t0:.1f}s")
+        logger.info(f"Model ready in {time.perf_counter() - t0:.1f}s")
     return _llama
 
 
@@ -277,74 +298,18 @@ def ensure_logging() -> None:
     _logging_ready = True
 
 
-# Conversation history: the last 20 messages (user + assistant turns) give the
-# model multi-turn context WITHIN a session. It is ephemeral by default -- each
-# restart begins empty and wipes the file. Set SHELLAI_PERSIST_HISTORY=1 to
-# carry it across restarts instead.
-MAX_HISTORY = 20
-HISTORY_FILE = os.environ.get("SHELLAI_HISTORY_FILE") or os.path.join(
-    _user_dir("state"), "history.json"
-)
-PERSIST_HISTORY = os.environ.get("SHELLAI_PERSIST_HISTORY", "").strip().lower() in (
-    "1", "true", "yes", "on"
-)
+# Conversation history: the last few messages (user + assistant turns) give the
+# model multi-turn context so an immediate follow-up ("now the same for /var",
+# "sort that by size") works. In-memory only -- nothing is written to disk, and
+# every restart starts fresh. Kept small on purpose: a 1.5B model is easily
+# nudged off-track by stale earlier commands sitting in the window.
+MAX_HISTORY = 10  # messages == 5 request/command exchanges
 history: list[dict] = []
 
 
 def load_history() -> None:
-    """Prepare `history` for this session.
-
-    Ephemeral by default: start empty and remove any file left by a previous
-    run. With SHELLAI_PERSIST_HISTORY=1, load the last MAX_HISTORY messages.
-    """
-    global history
-    if not PERSIST_HISTORY:
-        history = []
-        try:
-            os.remove(HISTORY_FILE)
-        except OSError:
-            pass
-        return
-    try:
-        with open(HISTORY_FILE, encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, list):
-            history = [
-                m for m in data
-                if isinstance(m, dict) and m.get("role") in ("user", "assistant")
-                and isinstance(m.get("content"), str)
-            ][-MAX_HISTORY:]
-    except FileNotFoundError:
-        pass
-    except (json.JSONDecodeError, OSError):
-        history = []
-
-
-def save_history() -> None:
-    """Persist the current conversation history (no-op unless PERSIST_HISTORY)."""
-    if not PERSIST_HISTORY:
-        return
-    try:
-        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(history, f, ensure_ascii=False, indent=2)
-    except OSError as e:
-        print(f"Warning: could not save history: {e}")
-
-
-def seed_readline_history():
-    """Seed the interactive prompt's up-arrow history with past user queries.
-
-    Pulls only user-role entries from the persisted history so the arrow
-    recalls *your* queries (most recent first), not the model's commands.
-    No-op if readline is unavailable (e.g. non-interactive stdin).
-    """
-    if readline is None:
-        return
-    user_queries = [m["content"] for m in reversed(history) if m["role"] == "user"]
-    add = getattr(readline, "add_history", None) or getattr(readline, "add_history_item")
-    for q in user_queries:
-        add(q)
-    readline.set_history_length(MAX_HISTORY)  # cap like the rolling history
+    """Reset conversation history for a fresh session (in-memory only)."""
+    history.clear()
 
 
 SYSTEM_PROMPT_CORE = """You are a precise shell-command translator for {os_label}. Given a short
@@ -357,16 +322,26 @@ Strict output rules:
 - If the request is ambiguous, pick the most common intent and do NOT ask
   clarifying questions.
 
-Scope rules (very important):
+Scope rules (very important -- these depend ONLY on whether a folder/scope
+word is present in the request, NEVER on which verb it uses: "find", "search",
+"list", "look for", "locate" etc. all resolve scope identically):
 - If the user says "the entire drive", "everything", or does NOT specify a
   folder, search from / (the filesystem root), NOT from . .
 - If the user names a specific directory (e.g. Downloads, ~/Documents, /var/log),
   use that path.
 - If the user says "in this folder", "here", or "current directory", use . .
+- A folder/file name the user gives you is literal data, never a word to
+  autocorrect or expand to a similar-looking dictionary word. "rnd" means a
+  folder literally named rnd, NOT "random"; "cfg" is not "config" unless the
+  user wrote that out. Copy such names byte-for-byte into the path.
 
 IMPORTANT: find outputs one bare path per line. To get size/date, you MUST use
 -exec stat or -exec ls. NEVER pipe bare find output into awk to extract
-"columns" -- there are no columns.
+"columns" -- there are no columns. But if the request only asks to find/list/
+search for/locate files (by name, extension, or type -- no size, date, owner,
+or other per-file detail asked for), output BARE paths -- do NOT tack on
+-exec ls / -exec stat "just in case"; only add it when a detail was actually
+requested.
 
 Multiple asks: if ONE request bundles several unrelated questions ("my IP and
 the wifi name and the battery and the time"), join the commands with ;
@@ -380,6 +355,15 @@ output, never just the bare number.
 
 If the request filters by a size in a human unit ("files larger than 3gb",
 "bigger than 500mb"), report each match's size in THAT unit, not raw bytes.
+
+Combined / total size of a set of files: pass them to `du -ch` -- it prints each
+file's size AND a final `total` line. For ONLY the total, append `| tail -1`.
+
+Discarding uncommitted changes ("wipe out my changes", "discard everything",
+"reset my working directory") means `git reset --hard` (tracked files) plus
+`git clean -fd` (untracked files) -- NEVER include `rm -rf .git` or anything
+that deletes the .git directory itself; that destroys the entire repository's
+history, not just the uncommitted changes that were actually asked for.
 """
 
 
@@ -392,12 +376,30 @@ Strict output rules:
 - Do NOT explain, think aloud, or add commentary. One line, one command.
 - If the request is ambiguous, pick the most common intent and do NOT ask
   clarifying questions.
+- Only filter by criteria the user actually stated (name, extension, type).
+  Never invent an unrequested size/date/count filter (e.g. a `@fsize GEQ ...`
+  threshold) just because a similar-looking example used one -- a plain
+  name search gets a plain name search, nothing more.
 
-Scope rules (very important):
+Scope rules (very important -- these depend ONLY on whether a folder/scope
+word is present in the request, NEVER on which verb it uses: "find", "search",
+"list", "look for", "locate" etc. all resolve scope identically):
 - If the user says "the whole drive", "everything", or does NOT specify a
-  folder, start from the drive root (C:\\), NOT the current directory.
+  folder, start from the drive root (C:\\), NOT the current directory and NOT
+  %USERPROFILE%/your home folder.
 - If the user names a specific directory, use that path.
 - If the user says "in this folder", "here", or "current directory", use "." .
+- A folder/file name the user gives you is literal data, never a word to
+  autocorrect or expand to a similar-looking dictionary word. "rnd" means a
+  folder literally named rnd, NOT "random"; "cfg" is not "config" unless the
+  user wrote that out. Copy such names byte-for-byte into the path.
+
+If the request only asks to find/list/search for/locate files (by name,
+extension, or type -- no size, date, owner, or other per-file detail asked
+for), print BARE paths only (e.g. `... | Select-Object -ExpandProperty
+FullName` in PowerShell, `dir /s /b` in cmd) -- do NOT add the full
+Get-ChildItem table or extra properties "just in case"; only do that when a
+detail was actually requested.
 
 Multiple asks: if ONE request bundles several unrelated questions ("my IP and
 the wifi name and the battery and the time"), join the commands with ; so every
@@ -405,6 +407,12 @@ part runs.
 
 If the request filters by a size in a human unit ("files larger than 3gb",
 "bigger than 500mb"), report each match's size in THAT unit, not raw bytes.
+
+Discarding uncommitted changes ("wipe out my changes", "discard everything",
+"reset my working directory") means `git reset --hard` (tracked files) plus
+`git clean -fd` (untracked files) -- NEVER delete the .git folder itself
+(e.g. Remove-Item -Recurse .git); that destroys the entire repository's
+history, not just the uncommitted changes that were actually asked for.
 """
 
 
@@ -431,7 +439,10 @@ def extract_command(raw: str) -> str:
 
     # A fenced code block anywhere in the reply is the command; trust its full
     # body so multi-line commands survive, and ignore any surrounding prose.
-    fence = re.search(r"```(?:bash|sh|shell|zsh)?[ \t]*\n?(.*?)```", text, re.S)
+    fence = re.search(
+        r"```(?:bash|sh|shell|zsh|powershell|pwsh|ps1|cmd|batch|bat)?[ \t]*\n?(.*?)```",
+        text, re.S,
+    )
     if fence:
         body = fence.group(1).strip()
         body = re.sub(r"^(?:A|Answer|Command|Output)\s*:\s*", "", body, flags=re.I)
@@ -467,6 +478,23 @@ def quiet_broad_find(command: str) -> str:
         if "2>/dev/null" not in command:
             return command + " 2>/dev/null"
     return command
+
+
+def fix_find_exec_terminator(cmd: str) -> str:
+    """Repair a `find ... -exec CMD {}` whose `\\;` (or `+`) terminator the model
+    mangled: `{} \\` / `{} \\ 2>/dev/null` (dangling backslash), a bare `{} ;`
+    that the shell would eat, or `{}` with no terminator at all before a
+    redirect / pipe / end of line. All -> `{} \\;`.
+    """
+    if "-exec" not in cmd:
+        return cmd
+    # `{} \` where the backslash is NOT already `\;`
+    cmd = re.sub(r"(\{\}\s*)\\(?!;)(\s|$)", r"\1\\;\2", cmd)
+    # bare, unescaped `{} ;`
+    cmd = re.sub(r"(\{\}\s*)(?<!\\);(\s|$)", r"\1\\;\2", cmd)
+    # `{}` immediately followed by a redirect / pipe / EOL and no `\;` or `+`
+    cmd = re.sub(r"(\{\})(\s*)(?=$|[|&]|\d*>)", r"\1 \\;\2", cmd)
+    return cmd
 
 
 def repair_command(cmd: str) -> str:
@@ -603,6 +631,9 @@ def _windows_ps_compat_fix(cmd: str) -> str:
     # Strip POSIX stderr-to-null; PowerShell uses -ErrorAction instead.
     cmd = re.sub(r"\s*2>\s*/dev/null\b", "", cmd)
     cmd = re.sub(r"\s*2>\s*nul\b", "", cmd, flags=re.I)
+    # "where am I" -> `cd /d %cd%` (a cmd no-op) / `echo %cd%` -> Get-Location
+    if re.fullmatch(r"\s*(?:cd(?:\s+/d)?\s+%cd%|echo\s+%cd%)\s*", cmd, re.I):
+        return "Get-Location"
     # `find . -name "*.py"` (and -iname) -> Get-ChildItem -Recurse -Filter
     m = re.match(
         r'find\s+(\S+)\s+(?:-type\s+f\s+)?-i?name\s+["\']?([^"\']+)["\']?\s*$', cmd
@@ -651,6 +682,10 @@ def _fix_forfiles_size(cmd: str) -> str:
 def _windows_cmd_compat_fix(cmd: str) -> str:
     """Nudge POSIX-isms into classic cmd.exe builtins."""
     cmd = re.sub(r"\s*2>\s*/dev/null\b", " 2>nul", cmd)
+    # "where am I": the model emits `cd /d %cd%` / `cd %cd%`, which is a no-op
+    # that prints nothing. Bare `cd` prints the working directory.
+    if re.fullmatch(r"\s*cd(?:\s+/d)?\s+%cd%\s*", cmd, re.I):
+        return "cd"
     toks = cmd.split()
     if toks:
         alias = {
@@ -708,14 +743,24 @@ Q: list the 10 largest files in my Downloads folder
 A: ls -lS ~/Downloads | tail -n +2 | head -n 10
 Q: find all .py files in the current project
 A: find . -name "*.py"
+Q: search for any file whose name contains ssn
+A: find / -iname "*ssn*" 2>/dev/null
 Q: count how many .log files are in /var/log
 A: find /var/log -type f -name "*.log" 2>/dev/null | wc -l
 Q: show a table of the 15 biggest files with size and modified date
 A: find / -type f -size +1G -exec stat -f "%z  %Sm  %N" {} \\; 2>/dev/null | sort -rn | head -n 15 | column -t
 Q: show the top 5 largest directories in the current folder
 A: du -d 1 -h . | sort -rh | head -n 5
+Q: list every .txt file with its size and the combined total
+A: find . -type f -name "*.txt" -exec du -ch {} + 2>/dev/null
+Q: total size of all .log files here
+A: find . -type f -name "*.log" -exec du -ch {} + 2>/dev/null | tail -1
 Q: list all folders here
-A: ls -d */""",
+A: ls -d */
+Q: go to rnd
+A: cd rnd
+Q: wipe out all my uncommitted changes
+A: git reset --hard && git clean -fd""",
     danger_extra=(),
     trivial_cmds=frozenset(
         "ls pwd clear echo whoami hostname uptime uname cal id sw_vers df date find".split()
@@ -749,14 +794,24 @@ Q: list the 10 largest files in my Downloads folder
 A: ls -lS ~/Downloads | tail -n +2 | head -n 10
 Q: find all .py files in the current project
 A: find . -name "*.py"
+Q: search for any file whose name contains ssn
+A: find / -iname "*ssn*" 2>/dev/null
 Q: count how many .log files are in /var/log
 A: find /var/log -type f -name "*.log" 2>/dev/null | wc -l
 Q: show a table of the 15 biggest files with size and modified date
 A: find / -type f -size +1G -exec stat -c "%s  %y  %n" {} \\; 2>/dev/null | sort -rn | head -n 15 | column -t
 Q: show the top 5 largest directories in the current folder
 A: du -h --max-depth=1 . | sort -rh | head -n 5
+Q: list every .txt file with its size and the combined total
+A: find . -type f -name "*.txt" -exec du -ch {} + 2>/dev/null
+Q: total size of all .log files here
+A: find . -type f -name "*.log" -exec du -ch {} + 2>/dev/null | tail -1
 Q: list all folders here
-A: ls -d */""",
+A: ls -d */
+Q: go to rnd
+A: cd rnd
+Q: discard all uncommitted changes and untracked files
+A: git reset --hard && git clean -fd""",
     danger_extra=(
         (re.compile(r"(?:^|(?<=[\s;&|(]))(?:apt|apt-get|dnf|yum|pacman|snap)\b.*"
                     r"\b(?:remove|purge|autoremove|-R\w*)\b", re.S | re.I),
@@ -802,14 +857,26 @@ Q: list the 10 largest files in my Downloads folder
 A: Get-ChildItem $HOME\\Downloads -File | Sort-Object Length -Descending | Select-Object -First 10 Name, Length
 Q: find all .py files in the current project
 A: Get-ChildItem -Recurse -File -Filter *.py
+Q: search for any file whose name contains ssn
+A: Get-ChildItem C:\\ -Recurse -File -ErrorAction SilentlyContinue | Where-Object Name -like "*ssn*" | Select-Object -ExpandProperty FullName
 Q: count how many .log files are in C:\\Logs
 A: (Get-ChildItem C:\\Logs -Recurse -File -Filter *.log -ErrorAction SilentlyContinue).Count
 Q: show a table of the 15 biggest files with size and modified date
 A: Get-ChildItem C:\\ -Recurse -File -ErrorAction SilentlyContinue | Sort-Object Length -Descending | Select-Object -First 15 Name, Length, LastWriteTime | Format-Table
 Q: show the top 5 largest directories in the current folder
 A: Get-ChildItem -Directory | Select-Object Name, @{n='MB';e={[math]::Round((Get-ChildItem $_.FullName -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum/1MB,1)}} | Sort-Object MB -Descending | Select-Object -First 5
+Q: total size of all .txt files here
+A: "{0:N2} MB" -f ((Get-ChildItem -Recurse -File -Filter *.txt -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum / 1MB)
+Q: list every .txt file with its size and the combined total
+A: $f = Get-ChildItem -Recurse -File -Filter *.txt -ErrorAction SilentlyContinue; $f | Select-Object FullName, Length; "TOTAL {0:N2} MB" -f (($f | Measure-Object Length -Sum).Sum / 1MB)
 Q: list all folders here
-A: Get-ChildItem -Directory""",
+A: Get-ChildItem -Directory
+Q: what is my current directory
+A: Get-Location
+Q: go to rnd
+A: Set-Location rnd
+Q: discard all uncommitted changes in this repo
+A: git reset --hard; git clean -fd""",
     danger_extra=(
         (re.compile(_B_WIN + r"(?:Remove-Item|ri|rm|del|erase|rd|rmdir)(?![\w-])",
                     re.I | re.S), "deletes files or folders"),
@@ -871,20 +938,30 @@ Q: tell me my ip address, the date, and my battery level
 A: ipconfig | findstr /C:"IPv4" & date /t & wmic path Win32_Battery get EstimatedChargeRemaining
 Q: list all files larger than 3 gb, show the size
 A: forfiles /P C:\\ /S /M * /C "cmd /c if @fsize GEQ 3221225472 echo @path (@fsize bytes)" 2>nul
-Q: find files bigger than 500mb in my Downloads folder
+Q: show files bigger than 500mb in my Downloads folder
 A: forfiles /P "%USERPROFILE%\\Downloads" /S /M * /C "cmd /c if @fsize GEQ 524288000 echo @path (@fsize bytes)" 2>nul
 Q: list the 10 largest files in my Downloads folder
 A: dir /a:-d /o:-s "%USERPROFILE%\\Downloads"
 Q: find all .py files in the current project
 A: dir /s /b *.py
+Q: find any file whose name contains ssn
+A: dir /s /b C:\\*ssn* 2>nul
+Q: search for any file whose name contains ssn
+A: dir /s /b C:\\*ssn* 2>nul
 Q: count how many .log files are in C:\\Logs
 A: dir /s /b C:\\Logs\\*.log 2>nul | find /c /v ""
 Q: show all files in this folder with size and date
 A: dir /a:-d
 Q: list all folders here
 A: dir /a:d /b
+Q: what is my current directory
+A: cd
 Q: what's my computer name and windows version
-A: hostname & ver""",
+A: hostname & ver
+Q: go to rnd
+A: cd rnd
+Q: discard all uncommitted changes in this repo
+A: git reset --hard && git clean -fd""",
     danger_extra=(
         (re.compile(_B_WIN + r"(?:del|erase)(?![\w-])", re.I | re.S),
          "deletes files (del)"),
@@ -1163,6 +1240,19 @@ _PS_MUTATING = re.compile(
     r"Disable|Enable|Suspend|Resume|Send|Format-Volume|iex)-?\w*"
 )
 
+
+def _ps_strip(s: str) -> str:
+    """Drop quoted strings and balanced {..} / @{..} blocks from a PowerShell
+    command, so a `;` or `|` inside a calculated property or a Where-Object
+    filter block isn't read as a command separator by is_trivial().
+    """
+    s = re.sub(r"'[^']*'|\"[^\"]*\"", "", s)
+    prev = None
+    while prev != s:                       # collapse innermost braces outward
+        prev = s
+        s = re.sub(r"@?\{[^{}]*\}", "", s)
+    return s
+
 # stderr/stdout redirections to the bit-bucket -- harmless, stripped before the
 # redirect check so they don't disqualify an otherwise trivial command.
 _NULL_REDIR = re.compile(r"\s*\d?>&?\s*(?:/dev/null|[12])\b")
@@ -1183,30 +1273,31 @@ def is_trivial(command: str) -> bool:
 
     if PROFILE.family == "windows":
         low = re.sub(r"\s*2>\s*(?:nul|\$null)\s*$", "", cmd, flags=re.I).strip()
-        if re.search(r"[<>`;&]|\$\(", low):
-            return False
 
         if PROFILE.name == "windows-powershell":
             # A read-only Get-* source, optionally piped through read-only
-            # filter/format stages. No mutating verb anywhere (covers blocks).
+            # filter/format stages. A mutating verb anywhere (incl. inside a
+            # script block) disqualifies -- checked on the raw string first.
             if _PS_MUTATING.search(low):
                 return False
-            stages = [s.strip() for s in low.split("|")]
-            if not stages[0]:
+            # Strip strings + {..}/@{..} blocks so a `;` or `|` inside a
+            # calculated property (`@{n='GB';e={...}}`) or a Where-Object filter
+            # block isn't mistaken for a command chain.
+            bare = _ps_strip(low)
+            if re.search(r"[<>`;&]|\$\(", bare):
                 return False
-            first = stages[0].split()[0].lower()
-            if first not in _PS_READ_CMDLETS:
+            stages = [s.strip() for s in bare.split("|")]
+            if not stages or not stages[0].split():
                 return False
-            for stage in stages[1:]:
-                toks = stage.split()
-                if not toks or toks[0].lower() not in (
-                    _PS_READ_CMDLETS | _PS_SAFE_FILTERS
-                ):
-                    return False
-            return True
+            if stages[0].split()[0].lower() not in _PS_READ_CMDLETS:
+                return False
+            ok = _PS_READ_CMDLETS | _PS_SAFE_FILTERS
+            return all(
+                st.split() and st.split()[0].lower() in ok for st in stages[1:]
+            )
 
         # cmd.exe has no real pipelines -- a single bare lookup only.
-        if "|" in low:
+        if re.search(r"[|&<>`;]|\$\(|\$\{", low):
             return False
         toks = low.split()
         return bool(toks) and toks[0].lower() in {c.lower() for c in _TRIVIAL_CMDS}
@@ -1249,11 +1340,14 @@ def is_trivial(command: str) -> bool:
     return True
 
 
-def get_shell_command(user_query: str) -> str:
+def get_shell_command(user_query: str, extra_turns: list[dict] | None = None) -> str:
     """Translate a natural-language request into a single shell command.
 
     Pure "text in -> command out": raises on model/inference failure and
     does NOT touch history. Callers record the turn via record_turn().
+
+    `extra_turns` is appended after the user query -- the refine-on-failure
+    path uses it to hand back the previous command plus an error / a hint.
     """
     ensure_logging()
 
@@ -1261,9 +1355,12 @@ def get_shell_command(user_query: str) -> str:
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     messages.extend(history)
     messages.append({"role": "user", "content": user_query})
+    messages.extend(extra_turns or [])
 
     logger.info("=" * 60)
     logger.info(f"USER QUERY: {user_query}")
+    if extra_turns:
+        logger.info(f"REFINE TURNS: {extra_turns}")
 
     try:
         t0 = time.perf_counter()
@@ -1287,7 +1384,8 @@ def get_shell_command(user_query: str) -> str:
     raw = raw.strip()
     extracted = extract_command(raw)
     if PROFILE.family == "posix":
-        command = repair_command(extracted)
+        command = fix_find_exec_terminator(extracted)
+        command = repair_command(command)
         command = compat_fix(command)
         command = fix_stat_format_escapes(command)
         command = fix_size_unit_math(command)
@@ -1298,11 +1396,40 @@ def get_shell_command(user_query: str) -> str:
         # The POSIX passes above are all find/stat/awk/&&/2>/dev/null specific;
         # the Windows dialects only need their own compat_fix.
         command = compat_fix(extracted)
+    command = quote_spaced_path(command)
 
     logger.info(f"RAW MODEL RESPONSE ({elapsed:.2f}s): {raw}")
     if command != extracted:
         logger.info(f"REPAIRED: {extracted}  ->  {command}")
     logger.info(f"EXTRACTED COMMAND: {command}")
+    return command
+
+
+_SINGLE_PATH_VERBS = re.compile(
+    r"^(cat|bat|less|more|head|tail|wc|nl|file|stat|open|xdg-open|ls|cd|"
+    r"type|Get-Content|gc)\s+(.+)$", re.I,
+)
+
+
+def quote_spaced_path(command: str) -> str:
+    """Quote an unquoted path that contains spaces.
+
+    The 1.5B model writes `cat ./Library/Application Support/x.txt` -- the shell
+    then splits it into two failing args. When the whole argument, joined,
+    actually exists on disk, wrap it in quotes. The `exists` check keeps this
+    from touching real multi-argument commands.
+    """
+    m = _SINGLE_PATH_VERBS.match(command.strip())
+    if not m:
+        return command
+    verb, rest = m.group(1), m.group(2).strip()
+    if rest.startswith("-") or " " not in rest:
+        return command
+    if any(ch in rest for ch in "|<>;&`\"'*?$()"):
+        return command
+    probe = os.path.expanduser(os.path.expandvars(rest))
+    if os.path.exists(probe):
+        return f'{verb} "{rest}"'
     return command
 
 
@@ -1322,7 +1449,7 @@ column jq yq less more man which env sleep
 
 # Tokens that legitimately introduce another command name after them.
 _CMD_WRAPPERS = frozenset(
-    "xargs sudo time env nice ionice nohup watch command exec then else do".split()
+    "xargs sudo time env nice ionice nohup watch command which exec then else do".split()
 )
 
 # Commands that essentially never appear as a bare argument or grep pattern,
@@ -1349,7 +1476,7 @@ def looks_malformed(command: str):
         return True, "empty"
     if cmd.endswith("\\"):
         return True, "ends with a bare line-continuation backslash"
-    if re.search(r"(\|\|?|&&?|;)\s*$", cmd):
+    if re.search(r"(\|\|?|&&?|(?<!\\);)\s*$", cmd):
         return True, "ends with a dangling shell operator"
 
     # Model degeneration: fed several requests at once, the 1.5B often loops,
@@ -1396,11 +1523,10 @@ def looks_malformed(command: str):
 
 
 def record_turn(user_query: str, command: str) -> None:
-    """Append this turn to the rolling history and persist it to disk."""
+    """Append this turn to the in-memory rolling history."""
     history.append({"role": "user", "content": user_query})
     history.append({"role": "assistant", "content": command})
     del history[:-MAX_HISTORY]  # keep only the last MAX_HISTORY messages
-    save_history()
 
 
 def _kill_group(proc: "subprocess.Popen") -> None:
@@ -1432,7 +1558,13 @@ def _exec_spec(command: str):
         return PROFILE.exec_argv(command)
     if PROFILE.name == "windows-powershell":
         exe = shutil.which("pwsh") or shutil.which("powershell") or "powershell"
-        return [exe, "-NoProfile", "-NonInteractive", "-Command", command], False
+        # Wrap so a *terminating* error -> exit 1, but non-terminating errors
+        # (e.g. Get-ChildItem -Recurse skipping folders it can't read, with
+        # -ErrorAction SilentlyContinue) don't -- otherwise `powershell -Command`
+        # exits 1 for a pipeline that actually succeeded and produced output,
+        # which then trips the refine-on-failure prompt.
+        wrapped = f"try {{ {command} }} catch {{ [Console]::Error.WriteLine($_); exit 1 }}; exit 0"
+        return [exe, "-NoProfile", "-NonInteractive", "-Command", wrapped], False
     return command, True
 
 
@@ -1556,17 +1688,61 @@ def _run_interruptible_windows(command: str, timeout: int) -> int:
         return 130
 
 
-def run_command(command: str, timeout: int = EXEC_TIMEOUT) -> int:
+# The last command run(), its exit code, and (when we captured it) its output.
+# Feeds the refine-on-failure prompt in handle_query.
+_LAST_RUN: dict = {"command": None, "exit": None, "output": ""}
+
+# Recursive scanners can run for a long time and stream progress -- keep them on
+# the interruptible path (live output + ESC) rather than buffering their output.
+_RECURSIVE_SCAN = re.compile(r"^\s*(?:find|forfiles)\b|(?<![\w-])-Recurse\b", re.I)
+
+
+def _run_capture(command: str, timeout: int) -> tuple[int, str]:
+    """Run to completion, echo what it printed, and return (exit_code, output).
+
+    Used for quick read-only lookups so a failure's output can be handed back
+    to the model. No ESC-to-stop -- these finish in well under a second.
+    """
+    target, use_shell = _exec_spec(command)
+    try:
+        p = subprocess.run(
+            target, shell=use_shell, timeout=timeout,
+            capture_output=True, text=True,
+        )
+        out, err, rc = p.stdout or "", p.stderr or "", p.returncode
+    except subprocess.TimeoutExpired as e:
+        out = (e.stdout or "") if isinstance(e.stdout, str) else ""
+        err = (e.stderr or "") if isinstance(e.stderr, str) else ""
+        print(f"\nCommand timed out after {timeout}s and was killed.")
+        return 124, out + err
+    except KeyboardInterrupt:
+        print("\n\033[2m[stopped -- back to AI-Shell]\033[0m")
+        return 130, ""
+    if out:
+        sys.stdout.write(out if out.endswith("\n") else out + "\n")
+    if err:
+        sys.stderr.write(err if err.endswith("\n") else err + "\n")
+    return rc, out + err
+
+
+def run_command(command: str, timeout: int = EXEC_TIMEOUT,
+                capture: bool | None = None) -> int:
     """Execute a shell command, streaming its output, and return the exit code.
 
     While it runs, pressing ESC (or Ctrl-C) stops just that command and
     returns to the prompt -- the REPL keeps going. Falls back to a plain
-    blocking run when stdin is not an interactive terminal.
+    blocking run when stdin is not an interactive terminal. Quick read-only
+    lookups are captured instead (see `_run_capture` / `_LAST_RUN`).
     """
     ensure_logging()
+    if capture is None:
+        capture = is_trivial(command) and not _RECURSIVE_SCAN.search(command)
+    output = None
     tty_in = sys.stdin.isatty()
     try:
-        if tty_in and termios is not None:
+        if capture:
+            rc, output = _run_capture(command, timeout)
+        elif tty_in and termios is not None:
             rc = _run_interruptible(command, timeout)
         elif tty_in and msvcrt is not None:
             rc = _run_interruptible_windows(command, timeout)
@@ -1575,7 +1751,20 @@ def run_command(command: str, timeout: int = EXEC_TIMEOUT) -> int:
     except (OSError, ValueError) as e:
         print(f"\nCould not execute command: {e}")
         logger.error(f"EXECUTION ERROR ({e}): {command}")
+        _LAST_RUN.update(command=command, exit=1, output="")
         return 1
+    # `find ... 2>/dev/null` exits 1 merely for skipping a directory it can't
+    # read -- the user asked for those errors to be suppressed, so the scan
+    # succeeded. Don't report it as a failure or trigger refine-on-failure.
+    if rc == 1 and re.match(r"\s*find\b", command) and re.search(
+        r"2>\s*/dev/null", command
+    ):
+        rc = 0
+
+    _LAST_RUN.update(
+        command=command, exit=rc,
+        output=(output or "")[-2000:],
+    )
     logger.info(f"EXECUTED (exit {rc}): {command}")
     # Surface a non-zero exit so a silent short-circuit isn't mistaken for
     # "it did nothing" -- e.g. `ipconfig getifaddr en0` prints nothing and
@@ -1634,6 +1823,10 @@ def apply_cd(command: str):
     )
     if not m:
         return False, command
+    # On Windows cmd, a bare `cd` PRINTS the working directory -- let it run
+    # rather than chdir'ing to home (POSIX semantics).
+    if PROFILE.family == "windows" and not m.group(1) and not m.group(2):
+        return False, command
     target = _resolve_cd_target(m.group(1))
     try:
         old = os.getcwd()
@@ -1647,51 +1840,111 @@ def apply_cd(command: str):
     return True, (m.group(2) or "").strip()
 
 
+def confirm_command(command: str) -> bool:
+    """The guard-rail gate: destructive commands need a typed 'yes', bare
+    read-only lookups auto-run, everything else asks y/N. The single place
+    this decision lives -- handle_query calls it once per attempt.
+    """
+    verdict, reason = classify_command(command)
+    if verdict == "danger":
+        print(f"\033[1;31m!  This command {reason}.\033[0m")
+        return input(
+            "Type 'yes' in full to run it (anything else cancels): "
+        ).strip().lower() == "yes"
+    if is_trivial(command):
+        print("\033[2m(auto-running: simple read-only command)\033[0m")
+        return True
+    return input("Execute this command? (y/N): ").strip().lower() == "y"
+
+
+def _refine(query: str, prev_command: str, feedback: str) -> "str | None":
+    """One refine round-trip: hand the model the previous command + a failure
+    message or hint, return a fresh command (None on inference failure)."""
+    logger.info(f"REFINE: {prev_command!r}  <-  {feedback!r}")
+    try:
+        return get_shell_command(query, extra_turns=[
+            {"role": "assistant", "content": prev_command},
+            {"role": "user", "content": feedback},
+        ])
+    except Exception as e:
+        print(f"\n\033[1;31mCould not refine the command: {e}\033[0m")
+        return None
+
+
 def handle_query(query: str) -> None:
-    """Translate one request, then propose / guard / (optionally) run it."""
+    """Translate one request, then propose / guard / (optionally) run it.
+
+    On a non-zero exit or a rejection, offer to hand the failure (or a
+    one-line hint) back to the model for a corrected command -- up to
+    REFINE_MAX times (SHELLAI_NO_REFINE=1 disables it).
+    """
     try:
         command = get_shell_command(query)
     except Exception as e:
         print(f"\n\033[1;31mCould not generate a command: {e}\033[0m")
         return
 
-    record_turn(query, command)
     print(f"\nProposed Command: \033[1;32m{command}\033[0m")
+    ran = command  # what we record to history at the end
 
-    bad, why = looks_malformed(command)
-    if bad:
-        print(f"\033[1;31mSkipping malformed command ({why}).\033[0m")
-        if any(k in why for k in ("two commands", "joined", "looped", "-exec")):
-            print("Looks like several requests at once -- ask one thing per line "
-                  '(or wrap one multi-line request in """).')
-        return
+    for attempt in range(1 + REFINE_MAX):
+        last_attempt = NO_REFINE or attempt == REFINE_MAX
 
-    # `cd` must change THIS process's directory to persist across turns.
-    handled, command = apply_cd(command)
-    if handled and not command:
-        return
+        bad, why = looks_malformed(command)
+        if bad:
+            print(f"\033[1;31mSkipping malformed command ({why}).\033[0m")
+            if any(k in why for k in ("two commands", "joined", "looped", "-exec")):
+                print("Looks like several requests at once -- ask one thing per "
+                      'line (or wrap one multi-line request in """).')
+            break
 
-    # Guard rail confirmation prompt; destructive commands need a typed "yes".
-    # A short allowlist of bare read-only lookups (ls, pwd, clear, ...) skips
-    # the prompt entirely -- the command is still printed above, just not run
-    # through an extra y/N for something this harmless.
-    verdict, reason = classify_command(command)
-    if verdict == "danger":
-        print(f"\033[1;31m!  This command {reason}.\033[0m")
-        approved = input(
-            "Type 'yes' in full to run it (anything else cancels): "
-        ).strip().lower() == "yes"
-    elif is_trivial(command):
-        print("\033[2m(auto-running: simple read-only command)\033[0m")
-        approved = True
-    else:
-        approved = input("Execute this command? (y/N): ").strip().lower() == "y"
+        # `cd` must change THIS process's directory to persist across turns.
+        handled, command = apply_cd(command)
+        if handled and not command:
+            break
+        ran = command
 
-    if approved:
+        if not confirm_command(command):
+            if last_attempt:
+                print("Execution cancelled.")
+                break
+            note = input(
+                "what should it do differently? (Enter to just retry): "
+            ).strip()
+            nxt = _refine(query, command,
+                          f"I don't want to run that."
+                          f"{(' ' + note) if note else ''} "
+                          "Give a different command for the same request.")
+            if nxt is None:
+                break
+            command = nxt
+            print(f"\nProposed Command: \033[1;32m{command}\033[0m")
+            continue
+
         sys.stdout.flush()  # the child writes to the fd directly; don't let
-        run_command(command)  # our own buffered prints land after its output
-    else:
-        print("Execution cancelled.")
+        rc = run_command(command)  # our own buffered prints land after its output
+        if rc in (0, 130) or last_attempt:
+            break
+        ans = input(
+            f"\n\033[2m↻ that exited {rc}. Fix it? (y/N, or type a hint)\033[0m "
+        ).strip()
+        if not ans or ans.lower() in ("n", "no"):
+            break
+        hint = "" if ans.lower() in ("y", "yes") else ans
+        fb = f"That command failed (exit {rc})."
+        if _LAST_RUN.get("command") == command and _LAST_RUN.get("output"):
+            fb += "\nOutput:\n" + _LAST_RUN["output"]
+        if hint:
+            fb += f"\nHint: {hint}"
+        fb += "\nGive a corrected command for the same request."
+        nxt = _refine(query, command, fb)
+        if nxt is None:
+            break
+        command = nxt
+        print(f"\nProposed Command: \033[1;32m{command}\033[0m")
+        ran = command
+
+    record_turn(query, ran)
 
 
 def read_request():
@@ -1779,13 +2032,10 @@ def _print_banner() -> None:
     w = 54  # inner width of the box (ASCII-only so padding is exact everywhere)
     rows = [
         c("platform ", "2") + PROFILE.os_label,
-        c("model    ", "2") + MODEL_REPO.split("/")[-1],
         "",
         c('multi-line: end a line with \\  or wrap a block in """', "2"),
         c('ESC stops a running command  ·  type "exit" to quit', "2"),
     ]
-    if history:
-        rows.append(c(f"resumed {len(history)} messages from history", "2"))
 
     def pad(s: str) -> str:
         vis = len(re.sub(r"\033\[[0-9;]*m", "", s))
@@ -1803,7 +2053,6 @@ def main():
     ensure_logging()
     load_history()
     get_local_model()
-    seed_readline_history()
     _print_banner()
     while True:
         request = read_request()
